@@ -124,11 +124,28 @@ GDB 连接后初始 PC 为 0x1000
 
 #### 实现迭代过程
 
-本模块经历了 1 次迭代。
+本模块经历了两步验证：
 
 ##### 第一次迭代
 
-执行执行 `make qemu` 启动。QEMU 使用 OpenSBI 固件，并将内核镜像加载到 `0x80200000`。启动时观察到：
+执行：
+
+```bash
+make
+make qemu
+```
+
+编译成功，但使用原来的 `-device loader` 启动时，OpenSBI 输出的 `Next Address` 没有设置为内核入口，QEMU 没有继续执行内核。
+
+##### 第二次迭代
+
+将 QEMU 启动参数改为：
+
+```makefile
+-kernel $(UCOREIMG)
+```
+
+重新测试后，OpenSBI 输出：
 
 ```text
 OpenSBI v0.9
@@ -172,7 +189,7 @@ Boot HART MEDELEG         : 0x000000000000b109
 (THU.CST) os is loading ...
 ```
 
-这说明 OpenSBI 将控制权交给了 `0x80200000` 处的内核，内核成功运行并输出启动信息。
+说明内核已经成功启动。随后使用 GDB 验证了 `0x1000`、`0x80200000` 和 `kern_init` 等关键位置。
 
 ---
 
