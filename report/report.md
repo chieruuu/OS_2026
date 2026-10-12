@@ -76,8 +76,6 @@ CPU 复位，PC = 0x1000
 
 Makefile 负责编译 C 和汇编源文件、链接目标文件，并生成 `bin/kernel` 和 `bin/ucore.img`。链接脚本规定内核的入口地址为 `kern_entry`，加载地址为 `0x80200000`。
 
-本机 QEMU/OpenSBI 版本使用原来的 `-device loader` 参数时没有正确设置 OpenSBI 的下一跳地址，因此将 `Makefile` 中的 QEMU 参数调整为 `-kernel $(UCOREIMG)`。调整后，OpenSBI 能正常跳转到内核入口。
-
 涉及的主要文件：
 
 - `Makefile`
