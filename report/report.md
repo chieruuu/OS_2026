@@ -106,8 +106,6 @@ make
 make qemu
 make debug
 make gdb
-kern_entry
-kern_init
 
 必须满足：
 
