@@ -189,6 +189,8 @@ Boot HART MEDELEG         : 0x000000000000b109
 
 说明内核已经成功启动。随后使用 GDB 验证了 `0x1000`、`0x80200000` 和 `kern_init` 等关键位置。
 
+![qemu截图](./images/qemu.png)
+
 ---
 
 ### 练习一：理解内核启动中的程序入口操作
@@ -256,6 +258,8 @@ Remote debugging using localhost:1234
 
 说明 CPU 复位后从地址 `0x1000` 开始执行。使用：
 
+![gdb截图](./images/gdb.png)
+
 ```gdb
 x/8i $pc
 ```
@@ -278,6 +282,8 @@ x/8i $pc
 - 读取 OpenSBI 的入口地址和启动参数；
 - 通过 `jr t0` 跳转到 OpenSBI。
 
+![x1截图](./images/x1.png)
+
 然后设置内核入口断点：
 
 ```gdb
@@ -294,6 +300,8 @@ $1 = 0x80200000
 ```
 
 这说明 OpenSBI 初始化完成后，已经把控制权交给了加载在 `0x80200000` 的内核。
+
+![b截图](./images/b.png)
 
 在内核入口处使用：
 
@@ -325,6 +333,8 @@ sp  0x80203000
 
 这证明 `la sp, bootstacktop` 已经设置好内核栈。继续执行并在 `kern_init` 设置断点：
 
+![info截图](./images/info.png)
+
 ```gdb
 b kern_init
 c
@@ -338,6 +348,8 @@ Breakpoint 2, kern_init () at kern/init/init.c:8
 ```
 
 说明汇编入口已经完成任务，程序正式进入 C 语言内核初始化函数。
+
+![kern_init截图](./images/kern_init.png)
 
 #### 问题回答
 
@@ -363,6 +375,8 @@ bin/kernel
 bin/ucore.img
 ```
 
+![make截图](./images/make.png)
+
 ### 2. QEMU 启动测试
 
 执行：
@@ -380,7 +394,7 @@ Domain0 Next Mode         : S-mode
 (THU.CST) os is loading ...
 ```
 
-输出后内核进入死循环，这是实验设计的正常结果。测试时可以使用 `Ctrl+C` 停止 QEMU。
+输出后内核进入死循环。
 
 ### 3. GDB 调试测试
 
@@ -395,8 +409,6 @@ Domain0 Next Mode         : S-mode
 
 这些结果与链接脚本、汇编入口代码和实际启动流程一致。
 
-
-![测试结果截图](./images/test_result.png)
 
 
 ---
