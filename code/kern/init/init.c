@@ -41,6 +41,7 @@ int kern_init(void) {
     pmm_init();  // init physical memory management
 
     //lab2 challenge slub 2412940
+    // 物理页分配器建立后初始化 SLUB，并运行对象分配、释放和资源守恒自检。
     slub_init();
     slub_check();
 

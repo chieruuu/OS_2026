@@ -32,23 +32,28 @@ static list_entry_t slub_large;
 static struct slub_slab *slub_owner[SLUB_PAGE_CAPACITY];
 static bool slub_ready;
 
+// 返回 slab 元数据按 16 字节对齐后占用的头部大小。
 static size_t slub_header_size(void) {
     return ROUNDUP(sizeof(struct slub_slab), SLUB_ALIGNMENT);
 }
 
+// 根据大小类别编号返回该类别的标准对象大小。
 static size_t slub_class_size(unsigned int id) {
     assert(id < SLUB_CLASSES);
     return (size_t)SLUB_ALIGNMENT << id;
 }
 
+// 返回 slab 头部之后、实际用于存放对象的起始地址。
 static unsigned char *slub_data(struct slub_slab *slab) {
     return (unsigned char *)slab + slub_header_size();
 }
 
+// 查询对象槽位在位图中是否已被占用。
 static bool slub_slot_used(struct slub_slab *slab, unsigned int slot) {
     return (slab->allocated[slot / 64] >> (slot % 64)) & 1;
 }
 
+// 设置或清除对象槽位对应的位图标志。
 static void slub_mark_slot(struct slub_slab *slab, unsigned int slot, bool used) {
     uint64_t mask = (uint64_t)1 << (slot % 64);
     if (used) {
@@ -58,6 +63,7 @@ static void slub_mark_slot(struct slub_slab *slab, unsigned int slot, bool used)
     }
 }
 
+// 初始化各大小类别的 partial/full 链表和大对象链表。
 void slub_init(void) {
     assert(!slub_ready);
     assert(pages != NULL && npage > nbase);
@@ -71,6 +77,8 @@ void slub_init(void) {
     slub_ready = 1;
 }
 
+// 从底层页分配器取得页面并建立一个新的 slab；小对象加入类别链表，
+// 大对象加入专用链表，并为其覆盖的每个物理页记录归属。
 static struct slub_slab *slub_new_slab(unsigned int id, size_t request_pages,
                                        size_t requested_bytes) {
     struct Page *page = alloc_pages(request_pages);
@@ -103,6 +111,7 @@ static struct slub_slab *slub_new_slab(unsigned int id, size_t request_pages,
     return slab;
 }
 
+// 分配对象：小对象从对应类别的 slab 槽位取得，大对象申请连续页面。
 void *kmalloc(size_t size) {
     assert(slub_ready);
     if (size == 0) {
@@ -148,6 +157,7 @@ void *kmalloc(size_t size) {
     return slub_data(slab) + slot * slab->object_size;
 }
 
+// 销毁空 slab，清除页面归属并将底层物理页归还给页面分配器。
 static void slub_destroy_slab(struct slub_slab *slab) {
     struct Page *page = slab->page;
     size_t index = page - pages;
@@ -161,6 +171,7 @@ static void slub_destroy_slab(struct slub_slab *slab) {
     free_pages(page, request_pages);
 }
 
+// 释放对象：验证地址和槽位归属，必要时销毁空 slab 并归还页面。
 void kfree(void *ptr) {
     if (ptr == NULL) {
         return;
@@ -196,6 +207,7 @@ void kfree(void *ptr) {
     }
 }
 
+// 校验一个 slab 链表中的所有 slab、对象位图和页面归属关系。
 static size_t slub_validate_list(list_entry_t *head, unsigned int id, bool full) {
     size_t used_pages = 0, entries = 0;
     list_entry_t *prev = head;
@@ -236,6 +248,7 @@ static size_t slub_validate_list(list_entry_t *head, unsigned int id, bool full)
     return used_pages;
 }
 
+// 汇总检查所有 slab 链表与页面归属表是否一致。
 static void slub_validate(void) {
     size_t listed = slub_validate_list(&slub_large, SLUB_CLASSES, 1);
     for (unsigned int i = 0; i < SLUB_CLASSES; i++) {
@@ -249,6 +262,7 @@ static void slub_validate(void) {
     assert(owned == listed);
 }
 
+// 按指定模式写入或检查对象内容，用于验证分配后的内存可访问性。
 static void slub_test_pattern(void *ptr, size_t size, unsigned char pattern, bool write) {
     unsigned char *bytes = ptr;
     for (size_t i = 0; i < size; i++) {
@@ -260,6 +274,7 @@ static void slub_test_pattern(void *ptr, size_t size, unsigned char pattern, boo
     }
 }
 
+// 执行 SLUB 的边界、共享页面、随机分配释放和无泄漏自检。
 void slub_check(void) {
     assert(slub_ready);
     size_t initial = nr_free_pages();

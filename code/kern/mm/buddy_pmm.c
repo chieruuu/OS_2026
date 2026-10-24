@@ -27,13 +27,14 @@ static size_t buddy_free_count;
 static unsigned int buddy_max_order;
 static unsigned char buddy_seen[BUDDY_CAPACITY];
 
+// 返回当前 page 数组中可由伙伴系统管理的描述符数量。
 static size_t buddy_page_count(void) {
     assert(pages != NULL && npage > nbase);
     assert(npage - nbase <= BUDDY_CAPACITY);
     return npage - nbase;
 }
 
-// Validate addresses as integers before doing descriptor pointer arithmetic.
+// 将 Page 指针安全转换为相对 pages 数组的下标，先检查地址和对齐。
 static size_t buddy_index(struct Page *page) {
     size_t count = buddy_page_count();
     uintptr_t address = (uintptr_t)page;
@@ -46,11 +47,13 @@ static size_t buddy_index(struct Page *page) {
     return index;
 }
 
+// 返回指定阶对应的页面数：order 为 k 时，块大小为 2^k 页。
 static size_t buddy_block_size(unsigned int order) {
     assert(order <= buddy_max_order);
     return (size_t)1 << order;
 }
 
+// 将申请页数向上取整到能够容纳它的最小伙伴阶。
 static bool buddy_request_order(size_t n, unsigned int *order) {
     assert(n > 0);
     if (n > buddy_block_size(buddy_max_order)) {
@@ -64,6 +67,7 @@ static bool buddy_request_order(size_t n, unsigned int *order) {
     return 1;
 }
 
+// 初始化伙伴系统的页面状态表、各阶空闲链表和统计信息。
 static void buddy_init(void) {
     memset(buddy_info, 0, sizeof(buddy_info));
     for (size_t k = 0; k < BUDDY_ORDER_COUNT; k++) {
@@ -76,6 +80,7 @@ static void buddy_init(void) {
     }
 }
 
+// 将一个空闲块作为指定阶的链表头插入，并更新 Page 元数据。
 static void buddy_link_block(size_t index, unsigned int order) {
     struct Page *base = pages + index;
     list_entry_t *head = &buddy_lists[order];
@@ -90,6 +95,7 @@ static void buddy_link_block(size_t index, unsigned int order) {
     list_add_before(le, &base->page_link);
 }
 
+// 从对应阶的空闲链表移除一个块，并清除块头标记。
 static void buddy_unlink_block(size_t index) {
     assert(buddy_info[index].state == BUDDY_FREE_HEAD);
     struct Page *base = pages + index;
@@ -100,7 +106,7 @@ static void buddy_unlink_block(size_t index) {
     buddy_info[index].order = 0;
 }
 
-// Count changes belong to allocation/registration/free, never to merging.
+// 反复查找同阶伙伴并合并；合并本身不重复修改空闲页计数。
 static void buddy_merge_block(size_t index, unsigned int order) {
     while (order < buddy_max_order) {
         size_t block_size = buddy_block_size(order);
@@ -123,6 +129,7 @@ static void buddy_merge_block(size_t index, unsigned int order) {
     buddy_link_block(index, order);
 }
 
+// 注册初始空闲页面，按地址对齐和最大阶逐块建立伙伴链表。
 static void buddy_init_memmap(struct Page *base, size_t n) {
     assert(n > 0);
     size_t index = buddy_index(base);
@@ -157,6 +164,7 @@ static void buddy_init_memmap(struct Page *base, size_t n) {
     }
 }
 
+// 分配满足请求的最小阶块；若只有更大块，则逐级分裂后返回低地址块。
 static struct Page *buddy_alloc_pages(size_t n) {
     unsigned int target;
     if (!buddy_request_order(n, &target)) {
@@ -193,6 +201,7 @@ static struct Page *buddy_alloc_pages(size_t n) {
     return base;
 }
 
+// 释放一个完整的伙伴块，清理页面状态并尝试与空闲伙伴逐级合并。
 static void buddy_free_pages(struct Page *base, size_t n) {
     assert(n > 0);
     size_t index = buddy_index(base);
@@ -220,11 +229,12 @@ static void buddy_free_pages(struct Page *base, size_t n) {
     buddy_merge_block(index, order);
 }
 
+// 返回伙伴系统当前可分配的物理页数量。
 static size_t buddy_nr_free_pages(void) {
     return buddy_free_count;
 }
 
-// Verify exact coverage, links, alignment, accounting, and maximal coalescing.
+// 校验空闲块覆盖范围、链表链接、对齐、计数和是否已经最大合并。
 static void buddy_validate(void) {
     size_t count = buddy_page_count();
     memset(buddy_seen, 0, count);
@@ -300,6 +310,7 @@ static void buddy_validate(void) {
 #define BUDDY_TEST_SLOTS 32
 static unsigned char buddy_test_model[BUDDY_CAPACITY];
 
+// 返回测试模型中请求 n 页时应占用的伙伴块大小。
 static size_t buddy_test_round(size_t n) {
     size_t rounded = 1;
     while (rounded < n) {
@@ -308,6 +319,7 @@ static size_t buddy_test_round(size_t n) {
     return rounded;
 }
 
+// 比较独立测试模型和真实伙伴系统的页面覆盖状态。
 static void buddy_test_validate(void) {
     buddy_validate();
     for (size_t i = 0; i < buddy_page_count(); i++) {
@@ -321,6 +333,7 @@ static void buddy_test_validate(void) {
     }
 }
 
+// 通过公开分配接口申请页面，并同步更新独立测试模型。
 static struct Page *buddy_test_allocate(size_t n) {
     size_t before = buddy_nr_free_pages();
     size_t rounded = buddy_test_round(n);
@@ -355,6 +368,7 @@ static struct Page *buddy_test_allocate(size_t n) {
     return p;
 }
 
+// 通过公开释放接口释放页面，并同步检查独立测试模型。
 static void buddy_test_release(struct Page *p, size_t n) {
     size_t before = buddy_nr_free_pages();
     size_t index = buddy_index(p);
@@ -371,11 +385,13 @@ static void buddy_test_release(struct Page *p, size_t n) {
     buddy_test_validate();
 }
 
+// 使用线性同余公式生成伙伴系统随机测试所需的伪随机数。
 static unsigned int buddy_test_random(unsigned int *seed) {
     *seed = *seed * 1664525U + 1013904223U;
     return *seed >> 8;
 }
 
+// 执行伙伴系统的定向测试、随机测试、错误输入检查和最终状态校验。
 static void buddy_check(void) {
     buddy_validate();
     size_t initial_free = buddy_nr_free_pages();
