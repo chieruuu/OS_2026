@@ -37,14 +37,22 @@
 
 ### 2.1 本章节的逻辑主线
 
-内核启动后先从设备树取得 DRAM 的基址和长度，再结合内核自身布局排除 OpenSBI、内核镜像和 Page 描述符数组占用的空间。剩余的完整页面由物理内存管理器接管。物理页分配器建立后，SLUB 再以这些页面为基础提供小对象分配。
+本实验围绕“物理内存如何从启动时的原始地址范围，逐步变成可供内核安全使用的分配资源”展开。内核启动后，首先从设备树读取 DRAM 的基址和长度，再结合 OpenSBI、内核镜像以及 Page 描述符数组的实际布局，划分出保留区和可管理区。只有完整、未被占用且按页对齐的物理页才能进入物理页分配器；这一阶段建立的是后续所有内存操作共同依赖的资源边界和页面状态。
 
-启动阶段已经建立 Sv39 映射，因此初始化还必须维持启动代码使用的虚拟地址到物理地址偏移。GDB 调试进一步观察了客体访存从软件 TLB 未命中、页表查询到 TLB 填充的过程。
+在物理页分配器之上，实验分别实现了 Best-Fit 和 Buddy System。Best-Fit 以按物理地址排列的空闲块链表为基础，解决连续页请求中的块选择、分裂、释放和相邻合并问题；Buddy System 则以阶为单位组织空闲块，通过分裂和伙伴合并维护不同大小的连续页块。两种分配器使用同一套 `Page` 描述符和 `pmm_manager` 接口，因此可以在保持上层调用方式不变的前提下替换底层策略。
+
+SLUB 位于页分配器之上，把物理页进一步组织为面向字节数的对象分配服务。小对象按大小类别共享 slab 页面，大对象直接使用连续页块；对象释放后，空闲槽位、空 slab 页面以及底层物理页依次恢复。这样，实验形成了清晰的分层关系：设备树和内核布局决定资源范围，Page 描述符记录页面状态，页分配器管理连续页面，SLUB 管理任意大小的内核对象。
+
+启动阶段已经建立 Sv39 映射，所以所有初始化和分配代码都必须沿用既有的虚拟地址到物理地址偏移，不能把物理地址、物理页号、Page 指针和内核虚拟地址混为一谈。GDB 调试则从执行路径上验证这一关系：先观察软件 TLB 未命中，再跟踪页表查询、物理地址形成和 TLB 填充，最后通过重复访问及 Bare 模式对比确认缓存命中和恒等映射路径。
 
 ### 2.2 功能的逐步实现
 
-1. 首先完成**功能模块一：物理内存初始化功能**，根据设备树和内核布局确定可管理的物理页范围，建立 Page 描述符并把空闲页面交给当前管理器，因为分配器必须先知道哪些页面可用、哪些区域需要保留。
-2. 接着完成**功能模块二：物理内存分配功能**，先阅读 First-Fit 的空闲块初始化、连续页面分配和回收合并流程，再实现并接入 Best-Fit，并通过 Buddy System 任务实现和测试另一种按阶分配方式，因为这些算法都依赖模块一建立的页面描述符和初始空闲区。
+1. 完成**功能模块一：物理内存初始化功能**。先确定 DRAM 的有效范围和管理上界，再计算 Page 描述符数组所需空间，依次保留固件、内核和描述符占用的页面，最后把剩余完整页面交给当前 `pmm_manager`。该模块的输出不是一次分配结果，而是整个内存管理系统可依赖的初始状态。
+2. 分析已有 First-Fit，明确空闲块链表、`property` 字段、页面标志和相邻合并之间的关系，为后续分配器实现建立共同语义。
+3. 完成**Best-Fit 连续页分配**。在同一套接口下增加最小可用块选择、低地址优先、剩余块分裂和释放时双向合并，并用定向测试和随机操作检查空闲页总量及链表状态。
+4. 完成**Buddy System 伙伴分配**。把连续页按阶组织，处理非 2 的幂请求的向上取整、大块逐级分裂、释放时的递归伙伴合并和原始申请页数记录，再用多种内存配置验证管理器能在启动流程中工作。
+5. 完成**SLUB 对象分配**并连接到底层页分配器。通过大小类别、slab 位图和大对象元数据实现对象复用与页面回收，再对边界、内容保护、资源不足和随机分配进行验证。
+6. 最后通过双 GDB 观察 Sv39 页表转换、软件 TLB 填充和 Bare 模式路径，把代码层面的地址计算与处理器执行路径对应起来。
 
 ---
 
@@ -56,9 +64,19 @@
 
 #### 模块功能描述
 
-实现 `page_init()`。函数通过设备树接口读取 DRAM 范围，将管理上界限制在框架允许范围内，根据内核结束地址布置连续的 Page 描述符数组，并将 OpenSBI、内核镜像、描述符数组及其占用的页面保留。描述符数组之后的完整页面通过当前 `pmm_manager` 注册为空闲区。
+实现 `page_init()` 的核心是把设备树给出的“地址范围”转换成分配器能够理解的“页面状态”。函数先读取 DRAM 基址和长度，并将末端限制在框架允许的物理地址上；随后依据 `end` 确定内核镜像结束位置，按页向上对齐 Page 描述符数组起点，再按照可管理页数和 `sizeof(struct Page)` 计算数组占用的字节数与页面数。OpenSBI、内核镜像、描述符数组以及它们覆盖的部分页面保持保留，描述符数组之后的完整页面才通过当前 `pmm_manager` 注册为空闲区。
 
-描述符数量由可管理页号范围决定：`npage` 是物理页号的排他上界，数组元素数为 `npage - nbase`。默认内存范围 `[0x80000000, 0x88000000)` 对应 `npage = 0x88000`、描述符数量 `0x8000`。代码不依赖这些默认值，而是根据探测范围和 `sizeof(struct Page)` 计算布局。
+这里的关键关系是：`nbase` 表示 DRAM 起始物理页号，`npage` 表示可管理物理页号的排他上界，因此 Page 数组元素数为 `npage - nbase`；`pages[i]` 描述的是从 `nbase + i` 开始的物理页。默认范围 `[0x80000000, 0x88000000)` 对应 `npage = 0x88000`，描述符数量为 `0x8000`，但这些数值只用于核对。实际布局始终由探测结果、内核结束地址、`sizeof(struct Page)` 以及页对齐计算得到，从而保证管理范围变化时地址转换和空闲区边界仍然一致。
+
+#### 实现函数及功能说明
+
+本模块实际完成的核心函数是 `page_init()`。`pmm_init()`、`dtb_init()` 和当前物理内存管理器的 `init_memmap()` 是它所在启动流程中的相关调用方或被调用接口，本模块的实现重点是完成物理内存布局和空闲页注册，而不是重新实现这些外围函数。
+
+| 函数 | 功能说明 |
+|------|----------|
+| `page_init()` | 读取设备树中的 DRAM 基址和大小，计算 `maxpa`、`npage`、Page 描述符数组和空闲区起点；保留已占用页面，并通过 `init_memmap()` 注册剩余完整页面。 |
+
+`page_init()` 通过 `get_memory_base()` 和 `get_memory_size()` 获取设备树结果，使用 `pa2page()`、`PADDR()` 以及当前管理器的 `init_memmap()` 完成地址转换和空闲区交接；这些函数属于相关调用接口，用于支撑 `page_init()` 的实现。
 
 #### 最终提示词
 
@@ -221,9 +239,11 @@ Requirements：
 
 **负责人：** 2412940-曹皓轩
 
-First-Fit 在按物理地址排序的空闲块链表中选择第一个足够大的块。申请后从块的低地址端取出所需页面，剩余部分继续作为空闲块；释放时将块按地址插入，并与物理上连续的前后块合并。块头的 `property` 记录连续页数，页面标志用于区分块头和普通页面。
+First-Fit 先在按物理地址排序的空闲块链表中顺序扫描，遇到第一个满足请求的块就停止。申请从该块的低地址端取出所需页面；如果块仍有剩余空间，则移动剩余块的起始位置并更新 `property`，否则将原块从链表移除。释放时，新块按照物理地址重新插入链表，再分别检查前驱和后继是否与释放块首尾相接，满足连续条件时合并并更新块头的页数。`PageProperty` 只标记空闲块头，`property` 保存该块包含的连续页面数，普通页面不参与空闲链表的块级描述。
 
-线性遍历在空闲块数量较多时会增加查找成本。可以考虑按大小分组、增加辅助索引或采用 Next-Fit；评估时还应观察不同申请序列下的碎片，而不能只比较一次分配的剩余空间。
+First-Fit 的代码为 Best-Fit 提供了页面状态、链表操作和计数维护的基准语义。两者的主要差异集中在“选择哪个可用块”：First-Fit 以首次命中为停止条件，查找路径短；Best-Fit 则需要扫描全部候选块并比较大小。通过先厘清这组共同语义，可以把后续验证重点放在选择策略差异，而不是重复验证底层页面状态规则。
+
+First-Fit 的函数实现属于工程已有代码，本报告只说明它作为 Best-Fit 的参照：它规定了 `PageProperty`、`property`、空闲链表和页面计数的基本语义，Best-Fit 在此接口约定上替换空闲块选择策略。
 
 ### 功能模块二任务二：Best-Fit 连续物理内存分配算法
 
@@ -231,9 +251,24 @@ First-Fit 在按物理地址排序的空闲块链表中选择第一个足够大�
 
 #### 模块功能描述
 
-实现 Best-Fit 管理器的初始化、内存注册、分配、释放和空闲页统计回调，并通过 `pmm_manager` 接口接入工程。分配时遍历空闲块，选择能够满足请求的最小块；大小相同时优先选择低地址块。大块从低地址处分配，剩余部分重新插入有序空闲链表。
+Best-Fit 管理器完整实现初始化、空闲区注册、连续页分配、页面释放和空闲页统计，并通过 `pmm_manager` 接入原有启动流程。初始化时建立空闲链表和页数统计；注册页面时清除保留标志、初始化引用计数，并把整个区间作为可管理资源加入链表。分配时遍历所有空闲块，比较每个块的 `property`，选择满足请求的最小块；大小相同时选择物理地址更低的块，使结果稳定且与地址有序链表一致。
 
-释放时按物理地址有序插入，仅合并物理上相邻的块。链表相邻本身不代表页面地址连续。原有 `basic_check()` 和 `best_fit_check()` 继续使用，用于检查基本分配行为和管理器状态。
+选定块后从低地址端分配请求页数：精确匹配时移除整个块，块更大时保留高地址部分并更新新的块头、页数和链表位置。释放时先按物理地址插入，再独立检查前后块的真实物理连续性；只有 `page2ppn(left) + left->property == page2ppn(base)` 或对应的后向关系成立时才合并。这样，链表顺序只承担查找和插入职责，页面地址连续性才决定是否合并，避免把“链表相邻”错误地当成“物理相邻”。`basic_check()` 和 `best_fit_check()` 继续作为公共行为检查，独立测试则补充碎片、失败不改状态和多次回收场景。
+
+#### 实现函数及功能说明
+
+本次在 `best_fit_pmm.c` 中实现了管理器的核心回调和内部辅助函数，并在 `best_fit_pmm_manager` 中完成注册。`basic_check()` 和 `best_fit_check()` 是工程原有的测试函数，本次保留并调用，没有将它们列为新实现内容。
+
+| 函数 | 功能说明 |
+|------|----------|
+| `best_fit_init()` | 初始化有序空闲链表，并将 `nr_free` 清零。 |
+| `best_fit_init_memmap(struct Page *base, size_t n)` | 检查输入页面仍为保留状态，清除旧的标志、引用计数和链表节点，再将整个连续区间注册为空闲块。 |
+| `best_fit_insert_block(struct Page *base, size_t n)` | 按物理地址将空闲块插入链表，设置块头的 `property`，增加空闲页计数，并检查前后块是否物理连续以执行合并。 |
+| `best_fit_alloc_pages(size_t n)` | 遍历所有空闲块，选择满足请求的最小块；同样大小时保留低地址块。分配后从块的低地址端取页，必要时把剩余部分作为新块插回链表。 |
+| `best_fit_free_pages(struct Page *base, size_t n)` | 检查待释放页面未被保留且不属于其他空闲块，清理页面状态后调用 `best_fit_insert_block()` 完成插入和相邻合并。 |
+| `best_fit_nr_free_pages()` | 返回 Best-Fit 当前维护的空闲页总数。 |
+
+其中 `best_fit_insert_block()` 是释放路径的核心：插入位置按 Page 指针顺序确定，合并条件则通过 `prev + prev->property == base` 和 `base + base->property == next` 判断真实物理连续性。这样可以同时维护有序链表、块头标志和全局空闲页计数。
 
 #### 最终提示词
 
@@ -563,9 +598,24 @@ check_alloc_page() succeeded!
 
 #### 模块功能描述
 
-Buddy System 按阶维护空闲块，阶 `k` 对应 `2^k` 个页面。申请页数向上取整到可满足请求的最小阶；大块逐级分裂。释放时，只有同阶、空闲且互为伙伴的块才能合并，伙伴位置依据绝对物理页号和块大小计算。
+Buddy System 按阶维护空闲块，阶 `k` 表示包含 `2^k` 个连续物理页的块。初始化时，注册区间被拆分为满足绝对物理页号对齐要求的若干块，并尽量合并到较高阶；分配时将请求页数向上取整到最小可容纳阶，从高阶空闲块开始逐级二分，直到得到目标阶块。释放时依据绝对物理页号和块大小计算伙伴位置，只有伙伴与当前块同阶、仍处于空闲状态且没有越过管理边界时才合并，合并后继续向更高阶检查。
 
-实现新增 `buddy_pmm.c` 和 `buddy_pmm.h`，通过 `pmm_manager` 接口接管初始化空闲区、分配、释放和统计。私有元数据记录页面状态、阶数和原始申请页数，使释放时遵守底层接口的整块释放约定。启动自检及独立模型测试检查空闲链表、页面覆盖、计数和合并结果。
+实现新增 `buddy_pmm.c` 和 `buddy_pmm.h`，通过 `pmm_manager` 复用原有初始化、分配、释放和统计接口。模块内部元数据记录每个活动分配块的起始页、实际阶数和原始申请页数：实际阶数用于定位和合并，原始页数用于遵守底层接口的释放约定。每次分裂、分配、释放和合并都同步维护 Page 标志、阶信息、空闲链表和总空闲页数；启动自检与独立模型测试分别检查这些状态是否覆盖完整、互不重叠且能够恢复到初始总量。
+
+#### 实现函数及功能说明
+
+本次 Buddy System 的核心实现集中在管理器回调函数，测试模型和校验函数属于验证部分，不作为主要实现函数展开。地址下标、阶数计算和链表插入/删除由模块内部辅助函数配合完成。
+
+| 函数 | 功能说明 |
+|------|----------|
+| `buddy_init()` | 清零页面状态表，初始化各阶空闲链表、空闲页计数和最大阶数。 |
+| `buddy_init_memmap(struct Page *base, size_t n)` | 注册一段连续页面，按照绝对物理页号对齐规则拆分成若干伙伴块，并调用合并逻辑形成尽可能大的空闲块。 |
+| `buddy_alloc_pages(size_t n)` | 计算目标阶，寻找可用的高阶块并逐级分裂，返回目标块起始 Page，同时记录实际阶数和原始申请页数。 |
+| `buddy_free_pages(struct Page *base, size_t n)` | 根据分配记录确认释放参数，恢复页面状态，增加空闲页计数，并从当前阶开始递归合并伙伴块。 |
+| `buddy_nr_free_pages()` | 返回所有阶空闲块包含的页面总数。 |
+| `buddy_check()` | 调用已实现的管理器检查逻辑，执行定向分配释放、非法请求、不同释放顺序和随机操作，确认测试结束后状态恢复。 |
+
+上述核心函数由 `buddy_request_order()`、`buddy_block_size()`、`buddy_link_block()`、`buddy_unlink_block()` 和 `buddy_merge_block()` 等内部辅助函数支撑：前两者负责请求取整和块大小计算，后者负责空闲块链表维护与伙伴合并。`buddy_check()` 使用这些函数完成管理器状态验证。
 
 #### 最终提示词
 
@@ -1096,9 +1146,24 @@ check_alloc_page() succeeded!
 
 #### 模块功能描述
 
-在 `slub.c` 和 `slub.h` 中实现 `slub_init()`、`kmalloc()`、`kfree()` 和 `slub_check()`。SLUB 将对象分配建立在物理页分配器之上：小对象按大小类别共享 slab 页面，较大对象使用连续页块。当前类别为 16 至 2048 字节的 2 的幂；超过最大类别的请求仍可通过大对象路径处理。
+在 `slub.c` 和 `slub.h` 中实现 `slub_init()`、`kmalloc()`、`kfree()` 和 `slub_check()`。SLUB 把字节级对象请求转换为两条路径：16、32、64、128、256、512、1024、2048 字节等 2 的幂类别由 slab 页面承载，超过最大类别的请求则根据元数据、对齐空间和有效载荷长度申请连续页块。小对象通过共享页面提高页面利用率，大对象路径则保证跨页请求拥有完整的连续空间。
 
-每个 slab 记录类别、槽位数量、使用数量和分配位图，对象起始地址按 16 字节对齐。部分使用的 slab 提供可用槽，满 slab 不参与分配；最后一个对象释放后将 slab 页面归还物理页分配器。大对象元数据保存原始申请页数，释放时按相同参数归还。
+每个 slab 保存所属类别、槽位容量、当前使用数和分配位图；对象起始地址按 16 字节对齐，且有效容量计算会扣除 slab 元数据和对齐空隙。分配时优先复用已有可用槽，类别没有可用槽时才向页分配器申请新页；释放时清除对应位图，最后一个活动对象释放后将整个 slab 页面归还。大对象元数据记录底层实际申请的原始页数和对象范围，`kfree()` 按该记录释放整块页面，从而使 SLUB 的页面占用能够回到测试前状态。
+
+#### 实现函数及功能说明
+
+本次 SLUB 的主要实现函数是公开接口和 slab 生命周期函数；大小类别、位图和链表校验函数属于支撑这些接口的内部辅助逻辑。
+
+| 函数 | 功能说明 |
+|------|----------|
+| `slub_init()` | 初始化各类别的 partial/full 链表、大对象链表和页面归属表，并设置 SLUB 已就绪标志。 |
+| `slub_new_slab()` | 通过 `alloc_pages()` 取得底层页面，建立 slab 元数据；小对象加入对应类别的 partial 链表，大对象加入 `slub_large` 链表，并记录每个页面的 slab 归属。 |
+| `kmalloc(size_t size)` | 将请求映射到最小可容纳的大小类别，优先复用 partial slab 的空闲槽；大对象则计算元数据和对齐开销后申请连续页面。 |
+| `slub_destroy_slab()` | 从链表和页面归属表中移除空 slab，并通过 `free_pages()` 归还其占用的底层页面。 |
+| `kfree(void *ptr)` | 根据对象地址定位所属 slab，区分小对象槽位和大对象页面块，更新位图及链表状态；当 slab 变空时回收页面。 |
+| `slub_check()` | 执行大小边界、共享页面、槽位复用、跨页大对象、随机分配释放和资源回收检查，并确认空闲页数恢复。 |
+
+`slub_header_size()`、`slub_class_size()`、`slub_data()`、`slub_slot_used()` 和 `slub_mark_slot()` 负责对象布局与位图操作；`slub_validate_list()`、`slub_validate()` 和 `slub_test_pattern()` 服务于内部一致性检查。核心调用链是 `kmalloc()` 通过 `slub_new_slab()` 获取页面，`kfree()` 在 slab 变空时调用 `slub_destroy_slab()`，最终将页面交还给 Buddy System。
 
 #### 最终提示词
 
@@ -1205,104 +1270,353 @@ Requirements：不能只验证返回值非空；同时验证对象层与物理�
 
 **负责人：** 2412940-曹皓轩
 
-#### 1. 调用路径和关键分支
+#### 调试步骤
 
-调试目标是内核对 `0xffffffffc0298548` 的 8 字节加载，该地址对应变量
-`buddy_free_count`。QEMU 中观察到的调用路径为：
+##### 1. 准备带调试信息的 QEMU 并编译内核
 
-```text
-load_helper
-  -> tlb_fill
-     -> riscv_cpu_tlb_fill
-        -> get_physical_address
-           -> tlb_set_page
-  -> load_memop
+进入 QEMU 4.1.1 源码目录，编译带调试信息的 RISC-V QEMU：
+
+```bash
+cd /path/to/qemu-4.1.1
+make distclean
+./configure --target-list=riscv64-softmmu --enable-debug
+make -j$(nproc)
 ```
 
-`load_helper()` 先用 `tlb_hit()` 检查当前页是否已有缓存映射。实际观察到
-`tlb_addr = 0xffffffffffffffff`，因此进入 `tlb_fill()`。`get_physical_address()`
-成功返回后，`tlb_set_page()` 将转换结果写入软件 TLB，控制权返回
-`load_helper()`，最后由 `load_memop()` 完成数据读取。这证明了访存的顺序是
-“先查 TLB，未命中后查页表，成功后填充 TLB”。
-
-#### 2. 页表遍历过程
-
-`env->satp = 0x8000000000080207`，其中 MODE 为 8，表示 Sv39；PPN 为
-`0x80207`，根页表物理地址为 `0x80207000`。GDB 观察到 `levels = 3`、
-`ptidxbits = 9`、`ptesize = 8`，说明每级使用 9 位 VPN 索引、每个 PTE 占
-8 字节。`get_physical_address()` 的循环在每一级完成以下动作：
-
-1. 从虚拟地址中提取当前级 VPN 索引；
-2. 计算 `pte_addr = base + idx * ptesize` 并读取 PTE；
-3. 检查 `PTE_V` 和权限位；
-4. 无 `R/W/X` 时把 PTE 作为下一级页表地址继续循环，具有叶节点权限时结束遍历；
-5. 根据 PTE 的 PPN、虚拟地址中的页内偏移和访问权限生成物理地址。
-
-本次实际单步得到 `idx = 0x1ff`、`pte_addr = 0x80207ff8`、
-`pte = 0x200000cf`、`ppn = 0x80000`。该 PTE 是有效叶节点，最终得到：
+编译完成后不要执行 `sudo make install`。记录调试版 QEMU 的绝对路径：
 
 ```text
-虚拟地址 0xffffffffc0298548 -> 物理地址 0x80298548
-prot = 7，返回值 = 0
+/path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64
 ```
 
-结果也符合内核线性映射：`0xffffffffc0298548 - 0xffffffff40000000 =
-0x80298548`。因此通过 GDB 验证了一个具体访存地址如何经过 QEMU 的 Sv39
-页表查询转换为物理地址。
+再进入本实验工程编译内核：
 
-#### 3. QEMU 中的 TLB 查找代码
+```bash
+cd /path/to/OS_2026/code
+make clean
+make -j2
+```
 
-QEMU 的软件 TLB 查找位于 `accel/tcg/cputlb.c` 的 `load_helper()`。它根据
-`mmu_idx` 和虚拟地址计算索引，读取 `CPUTLBEntry`，再用 `tlb_hit()` 判断
-当前项是否覆盖目标虚拟页。未命中时调用 `tlb_fill()`，再由 RISC-V 后端的
-`riscv_cpu_tlb_fill()` 调用 `get_physical_address()`。转换成功后，
-`tlb_set_page()` 将页对齐的映射写入 TLB。
+**【截图 1 插入位置】**：在 QEMU 和内核都编译完成后截图，画面中应能看到 `make -j$(nproc)`、`make -j2` 的完成输出，以及调试版 `qemu-system-riscv64` 文件路径。
 
-在本次调试中，首次访问命中 `load_helper()` 断点时 `tlb_addr` 为无效值；
-随后命中 `get_physical_address()` 和 `tlb_set_page()` 断点。第二次访问同一
-地址时没有再次命中这两个断点，证明软件 TLB 的缓存路径确实生效。
+##### 2. 启动 QEMU 并建立双重 GDB 环境
 
-#### 4. QEMU TLB 与真实 CPU TLB 的区别
+需要打开三个终端窗口。
 
-二者的逻辑作用相同：都缓存虚拟页号到物理页帧号的映射，访问命中时跳过
-页表遍历，未命中时重新进行地址转换。区别在于真实 CPU 使用硬件 TLB，查找
-和替换由处理器电路完成；QEMU 使用 `CPUTLBEntry`、索引计算、条件判断和
-`tlb_set_page()` 等 C 代码模拟这一过程。
+**终端 1：启动暂停的 QEMU。**
 
-为对比关闭分页的情况，调试了启动早期 `sd a0,0(t0)` 对 `0x80208000` 的
-存储访问。此时 `satp = 0`、`vm = 0`，QEMU 进入 Bare 分支，直接令
-`*physical = addr`，实际观察到 `0x80208000 -> 0x80208000`，然后仍将
-恒等映射写入软件 TLB。Bare 模式没有 SATP 根页表和 PTE 遍历，这也是它与
-Sv39 路径的主要差异。
+```bash
+cd /path/to/OS_2026/code
+make QEMU=/path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64 debug
+```
 
-#### 5. 调试中的细节和收获
+`debug` 目标会使用 `-s -S` 启动 QEMU：1234 端口用于客体 GDB，客体 CPU 在连接 GDB 前保持暂停。
 
-双 GDB 调试时，RISC-V GDB 控制客体内核，普通 GDB 控制 QEMU 进程。主机
-GDB 命中断点会暂停整个模拟器，客体 GDB 的单步必须等待 QEMU 继续运行；
-因此需要交替使用两个会话。源码断点停在某一行时，还要用 `next`、`until`
-或寄存器值确认该行是否已经执行，不能只看当前源码行。
+**终端 2：调试 QEMU 进程。**
 
-本次还观察到页表项的页对齐映射与实际访问地址的页内偏移是分开的：
-`tlb_set_page()` 写入的是 `0xffffffffc0298000 -> 0x80298000`，而实际加载
-地址的偏移 `0x548` 在最终内存访问时保留。这个过程把“页表转换”和“页内
-偏移拼接”具体展示出来。
+```bash
+pgrep -af qemu-system-riscv64
+gdb /path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64
+```
 
-#### 6. AI 辅助调试过程
+在宿主机 GDB 中执行：
 
-调试前使用大模型确认了两个 GDB 的职责、带调试信息 QEMU 的构建方式以及
-条件断点的设置方法。随后根据实验指导书中的调用路径，在 QEMU 源码中定位
-`load_helper()`、`get_physical_address()` 和 `tlb_set_page()`，再用实际日志
-校正断点位置和参数。调试中出现 QEMU 因 SIGPIPE 停止的问题后，通过设置
-`handle SIGPIPE nostop noprint pass` 解决；遇到源码行与寄存器状态不同步时，
-通过单步和变量打印确认真实执行顺序。最终日志显示：
+```gdb
+set pagination off
+set breakpoint pending on
+attach <QEMU进程PID>
+handle SIGPIPE nostop noprint pass
+continue
+```
+
+这里使用普通的宿主机 `gdb`，因为调试目标是本机运行的 QEMU 进程。
+
+**终端 3：调试 ucore 内核。**
+
+```bash
+cd /path/to/OS_2026/code
+make gdb
+```
+
+该命令使用 `riscv64-unknown-elf-gdb` 加载 `bin/kernel` 并连接 `localhost:1234`。如果没有自动停在 `kern_init`，在终端 3 执行：
+
+```gdb
+break kern_init
+continue
+```
+
+**【截图 2 插入位置】**：三个终端建立连接后截图。终端 2 应显示已经附加 QEMU，终端 3 应显示已经连接远程目标并停在 `kern_init` 或内核启动代码。
+
+##### 3. 在客体 GDB 中确定目标访存地址
+
+当前工程的 Buddy System 中有 `buddy_free_count`，它会在页分配器检查过程中被读取。先在终端 3 中查看该变量的虚拟地址，并反汇编读取它的函数：
+
+```gdb
+print/x &buddy_free_count
+disassemble /m buddy_nr_free_pages
+```
+
+在反汇编中找到读取 `buddy_free_count` 的 `ld` 指令，记录该指令地址，并查看对应指令：
+
+```gdb
+x/4i <读取buddy_free_count的指令地址>
+break *<读取buddy_free_count的指令地址>
+```
+
+将变量地址记为 `<VA>`，将其所在页按 4 KiB 对齐后的地址记为 `<PAGE_VA>`。例如，如果 GDB 输出：
 
 ```text
-[Dual GDB] Sv39 walk, TLB fill, and warm load PASS
-[Dual GDB] Bare identity translation and software TLB fill PASS
+&buddy_free_count = 0xffffffffc0298548
 ```
 
-这次调试的结论不是只依赖模型解释，而是用 QEMU 源码断点、GDB 变量值和
-实际地址转换结果完成了验证。
+则：
+
+```text
+<VA>      = 0xffffffffc0298548
+<PAGE_VA> = 0xffffffffc0298000
+```
+
+如果编译器没有保留 `buddy_nr_free_pages()` 的独立符号，可以在终端 3 执行：
+
+```gdb
+break buddy_check
+continue
+disassemble /m buddy_check
+```
+
+然后从 `buddy_check()` 的反汇编中选择一条明确读取内核高地址数据的 `ld` 指令。
+
+**【截图 3 插入位置】**：终端 3 中同时显示 `&buddy_free_count` 的虚拟地址、目标加载指令、指令地址和客体断点。
+
+##### 4. 在 QEMU 中设置 TLB 和页表断点
+
+目标地址确定后，回到终端 2。若终端 2 当前正在运行 QEMU，按一次 `Ctrl-C` 暂停宿主机 GDB；如果已经回到 GDB 提示符，直接继续执行下面的命令。
+
+将 `<VA>` 和 `<PAGE_VA>` 替换为终端 3 中得到的实际值：
+
+```gdb
+break load_helper
+condition 1 addr == <VA>
+
+break get_physical_address
+condition 2 addr == <VA> && access_type == 0
+
+break tlb_set_page
+condition 3 vaddr == <PAGE_VA>
+```
+
+当前一次运行可以使用下面的地址作为示例，实际运行时以终端 3 的输出为准：
+
+```gdb
+break load_helper
+condition 1 addr == 0xffffffffc0298548
+break get_physical_address
+condition 2 addr == 0xffffffffc0298548 && access_type == 0
+break tlb_set_page
+condition 3 vaddr == 0xffffffffc0298000
+```
+
+如果条件断点提示参数名不存在，先使用无条件断点查看参数：
+
+```gdb
+delete 1
+break load_helper
+continue
+info args
+info locals
+```
+
+再按照 `info args` 显示的实际参数名重新设置条件。断点函数的作用分别是：`load_helper()` 观察 TLB 查找，`get_physical_address()` 观察 Sv39 页表遍历，`tlb_set_page()` 观察软件 TLB 回填。
+
+**【截图 4 插入位置】**：终端 2 中显示三个条件断点已经设置成功，断点位置分别位于 `load_helper()`、`get_physical_address()` 和 `tlb_set_page()`。
+
+##### 5. 观察第一次访问：TLB 未命中
+
+回到终端 3 执行：
+
+```gdb
+continue
+```
+
+终端 2 应首先停在 `load_helper()`。在终端 2 中执行：
+
+```gdb
+backtrace 5
+info args
+info locals
+print/x addr
+```
+
+查看当前 TLB 项的读地址字段。不同 QEMU 源码版本的变量名可能不同，先通过 `info locals` 找到对应的 TLB 项，再执行类似命令：
+
+```gdb
+print/x entry->addr_read
+```
+
+如果该字段为无效值（常见为 `0xffffffffffffffff`），说明目标虚拟页没有命中软件 TLB。随后 QEMU 会进入 `tlb_fill()`，再调用 RISC-V 后端的 `riscv_cpu_tlb_fill()` 和 `get_physical_address()`。
+
+**【截图 5 插入位置】**：终端 2 停在 `load_helper()` 时截图，画面中应包含目标虚拟地址、无效的 TLB 项字段和调用栈，用于证明第一次访问发生了 TLB 未命中。
+
+##### 6. 单步观察 Sv39 三级页表遍历
+
+在终端 2 继续执行到页表翻译断点：
+
+```gdb
+continue
+```
+
+停在 `get_physical_address()` 后，先记录地址转换参数和页表配置：
+
+```gdb
+backtrace 6
+info args
+info locals
+print/x addr
+print/x env->satp
+print levels
+print ptidxbits
+print ptesize
+```
+
+在页表遍历循环中使用 `next` 单步，每一级记录以下变量：
+
+```gdb
+print/x idx
+print/x pte_addr
+print/x pte
+print/x ppn
+next
+```
+
+当 `R/W/X` 权限位均为 0 时，当前 PTE 是下一级页表地址，继续下一轮；当权限位出现有效值时，当前 PTE 是叶节点，页表遍历结束。Sv39 每级使用 9 位 VPN 索引，PTE 大小为 8 字节。
+
+在叶节点已经确定、物理地址即将返回时执行：
+
+```gdb
+print/x *physical
+print/x prot
+print/x ret
+```
+
+对于示例地址，最终转换关系应为：
+
+```text
+VA 0xffffffffc0298548 -> PA 0x80298548
+```
+
+页内偏移 `0x548` 保持不变，也可以用线性映射偏移核对：
+
+```text
+0xffffffffc0298548 - 0xffffffff40000000 = 0x80298548
+```
+
+**【截图 6 插入位置】**：终端 2 停在 `get_physical_address()` 的叶节点处理位置时截图，画面中应包含 `satp`、当前级索引、PTE 地址、PTE 值、`ppn` 和最终物理地址。
+
+##### 7. 观察软件 TLB 回填
+
+在终端 2 执行：
+
+```gdb
+continue
+```
+
+程序应停在 `tlb_set_page()`。执行：
+
+```gdb
+backtrace 5
+info args
+info locals
+print/x vaddr
+print/x paddr
+```
+
+如果当前版本存在缓存项变量，再查看其内容：
+
+```gdb
+print/x $cached_entry->addr_read
+print/x $cached_entry->addend
+```
+
+此处应看到页对齐后的映射，例如：
+
+```text
+virtual page: 0xffffffffc0298000
+physical page: 0x0000000080298000
+```
+
+这里显示的是页基址，真正的加载地址还要加上页内偏移 `0x548`。
+
+**【截图 7 插入位置】**：终端 2 停在 `tlb_set_page()` 时截图，画面中应包含虚拟页基址、物理页基址和软件 TLB 缓存项。
+
+##### 8. 观察第二次访问：TLB 命中
+
+继续运行终端 2 和终端 3，使同一虚拟页再次被访问：
+
+```gdb
+# 终端 2
+continue
+
+# 终端 3：在目标加载指令处继续执行
+continue
+```
+
+第二次访问应再次经过 `load_helper()`，但不再进入 `get_physical_address()` 和 `tlb_set_page()`。终端 2 停在 `load_helper()` 后执行：
+
+```gdb
+print/x addr
+info locals
+print/x entry->addr_read
+backtrace 5
+```
+
+如果 `entry->addr_read` 已经覆盖目标页，并且页表遍历和 TLB 回填断点没有再次命中，则说明第二次访问使用了已经填充的软件 TLB。
+
+**【截图 8 插入位置】**：终端 2 第二次停在 `load_helper()` 时截图，画面中应显示目标页已经命中 TLB，且没有重新进入 `get_physical_address()` 和 `tlb_set_page()`。
+
+##### 9. 观察 Bare 模式地址转换
+
+Bare 模式需要重新启动一次 QEMU，使调试回到 `satp` 写入之前。终止当前 QEMU 后，在终端 1 重新执行：
+
+```bash
+make QEMU=/path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64 debug
+```
+
+按照第 2 步重新连接终端 2 和终端 3。终端 3 中执行：
+
+```gdb
+break kern_entry
+continue
+disassemble /m kern_entry
+```
+
+找到 `csrw satp` 之前的 `sd` 访存指令，在该指令处设置断点：
+
+```gdb
+break *<csrw satp之前的访存指令地址>
+continue
+x/i $pc
+info registers satp
+si
+```
+
+在终端 2 的 QEMU GDB 中保留或重新设置 `get_physical_address()` 断点。当该访存触发时，查看：
+
+```gdb
+info args
+info locals
+print/x addr
+print/x *physical
+```
+
+此时 `satp` 为 0，QEMU 进入 Bare 分支，直接令物理地址等于输入地址，不进行 Sv39 页表遍历。例如访问 `0x80208000` 时应观察到：
+
+```text
+satp = 0
+vm = 0
+VA 0x80208000 -> PA 0x80208000
+```
+
+**【截图 9 插入位置】**：终端 2 停在 Bare 分支时截图，画面中应包含 `satp=0`、Bare 分支、输入地址和输出物理地址。
 
 ---
 
@@ -1323,7 +1637,7 @@ make -j2
 make qemu
 ```
 
-启动输出包含物理内存管理器名称、页面分配自检、页表信息，以及 Buddy 和 SLUB 自检结果。内核完成初始化后进入主循环，因此启动验证以观察到自检输出为准。
+启动输出依次给出物理内存管理器名称、页面分配自检、页表信息以及 Buddy 和 SLUB 自检结果。这里的验证链条是连续的：管理器名称确认实际接入的实现，页面自检确认初始化后的空闲页状态，Buddy 自检确认分裂/合并和计数逻辑，SLUB 自检确认对象分配建立在可用页块之上。内核完成初始化后进入主循环，因此以启动日志中这些自检项的实际输出作为集成验证依据。
 
 Best-Fit 评分在 Best-Fit 配置的临时副本中执行：
 
@@ -1335,33 +1649,26 @@ Total Score: 20/20
 
 ### 测试结果
 
-| 测试项目 | 结果 |
-|----------|------|
-| 工程编译链接 | 通过 |
-| 物理内存初始化边界测试 | 15 项通过 |
-| Best-Fit 定向与随机测试 | 通过，随机操作 10000 次 |
-| Best-Fit 配置评分 | 20/20 |
-| Buddy 定向、随机及负向测试 | 通过，5000 次随机操作、13 项负向测试 |
-| Buddy 内核启动配置 | 64、128、256 MiB 下通过 |
-| SLUB 边界与随机测试 | 31 个边界、1200 次随机操作、10 项负向测试通过 |
-| SLUB 内核启动配置 | 64、128、256 MiB 下通过 |
-| 双 GDB 地址转换观察 | Sv39 页表查询、TLB 填充、重复访问及 Bare 模式对比完成 |
-
-默认工程使用 Buddy System；Best-Fit 的评分单独在对应管理器配置下完成。
-
-**测试截图：**
-
 ![完整编译结果](./images/terminal_build.png)
+
+图中显示项目执行 `make -j2` 后完成编译和链接，并生成可启动的内核镜像。该结果确认物理内存初始化、Best-Fit、Buddy System、SLUB 以及相关测试代码都能够通过当前工程的编译配置。
 
 ![内核启动与 Buddy、SLUB 自检](./images/terminal_boot.png)
 
+启动截图展示了默认 Buddy System 配置下的集成运行结果。日志中的管理器名称确认当前接入的是 `buddy_pmm_manager`，随后执行页面分配检查、Buddy 自检和 SLUB 自检，说明从物理页初始化到对象分配的调用链已经完整运行。
+
 ![Best-Fit 评分结果](./images/terminal_grade.png)
+
+Best-Fit 评分在切换到 Best-Fit 管理器的临时配置中执行。截图中的 `check page init: OK` 和 `check best fit: OK` 分别对应物理内存初始化和 Best-Fit 管理器检查，最终得到 `Total Score: 20/20`。默认工程仍使用 Buddy System，因此该评分与默认启动配置分开验证。
 
 ![伙伴系统独立测试结果](./images/terminal_buddy.png)
 
+Buddy 独立测试覆盖了初始化布局、按阶分配、块分裂、不同释放顺序、伙伴递归合并、资源耗尽和非法请求。测试包含 5000 次随机操作以及 13 项负向测试，随机操作结束后空闲页计数恢复到初始状态；同时在 64、128、256 MiB 内存配置下完成内核启动自检。
+
 ![SLUB 独立测试结果](./images/terminal_slub.png)
 
-![双 GDB 调试记录](./images/terminal_debug.png)
+SLUB 独立测试覆盖 31 个大小边界，包括类别边界、跨页大对象和资源不足场景；同时验证多个小对象共享 slab 页面、槽位复用、对象内容保护和空 slab 页面回收。1200 次随机分配释放和 10 项负向测试完成后，活动对象内容保持正确，底层空闲页数恢复。
+
 
 ---
 
@@ -1377,7 +1684,7 @@ Total Score: 20/20
 | 对象分配 | SLUB 将一页切分为多个对象槽 | 小对象可以共享页面，空 slab 页面最终归还页分配器 |
 | 虚拟地址转换 | Sv39、satp、页表项和软件 TLB | 页表决定客体虚实转换，QEMU 软件 TLB 缓存转换以加快模拟 |
 
-通用操作系统还需要处理按需分页、缺页异常、页面置换、交换空间、写时复制、用户地址空间、多核 TLB 同步、NUMA 和内存热插拔等问题，本实验未涉及这些机制。
+本实验的验证重点集中在物理内存发现、页帧管理、连续页分配、SLUB 对象分配和 Sv39 地址转换；按需分页、缺页异常、页面置换、交换空间、写时复制、用户地址空间、多核 TLB 同步、NUMA 与内存热插拔等机制可在此分层结构之上继续展开。
 
 ### AI 协作开发的经验
 
