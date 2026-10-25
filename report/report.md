@@ -1270,26 +1270,127 @@ Requirements：不能只验证返回值非空；同时验证对象层与物理�
 
 **负责人：** 2412940-曹皓轩
 
-#### 调试步骤
+#### 1. 调用路径和关键分支
 
-##### 1. 准备带调试信息的 QEMU 并编译内核
+调试目标是内核对 `0xffffffffc0298548` 的 8 字节加载，该地址对应变量
+`buddy_free_count`。QEMU 中观察到的调用路径为：
 
-进入 QEMU 4.1.1 源码目录，编译带调试信息的 RISC-V QEMU：
+```text
+load_helper
+  -> tlb_fill
+     -> riscv_cpu_tlb_fill
+        -> get_physical_address
+           -> tlb_set_page
+  -> load_memop
+```
+
+`load_helper()` 先用 `tlb_hit()` 检查当前页是否已有缓存映射。实际观察到
+`tlb_addr = 0xffffffffffffffff`，因此进入 `tlb_fill()`。`get_physical_address()`
+成功返回后，`tlb_set_page()` 将转换结果写入软件 TLB，控制权返回
+`load_helper()`，最后由 `load_memop()` 完成数据读取。这证明了访存的顺序是
+“先查 TLB，未命中后查页表，成功后填充 TLB”。
+
+#### 2. 页表遍历过程
+
+`env->satp = 0x8000000000080207`，其中 MODE 为 8，表示 Sv39；PPN 为
+`0x80207`，根页表物理地址为 `0x80207000`。GDB 观察到 `levels = 3`、
+`ptidxbits = 9`、`ptesize = 8`，说明每级使用 9 位 VPN 索引、每个 PTE 占
+8 字节。`get_physical_address()` 的循环在每一级完成以下动作：
+
+1. 从虚拟地址中提取当前级 VPN 索引；
+2. 计算 `pte_addr = base + idx * ptesize` 并读取 PTE；
+3. 检查 `PTE_V` 和权限位；
+4. 无 `R/W/X` 时把 PTE 作为下一级页表地址继续循环，具有叶节点权限时结束遍历；
+5. 根据 PTE 的 PPN、虚拟地址中的页内偏移和访问权限生成物理地址。
+
+本次实际单步得到 `idx = 0x1ff`、`pte_addr = 0x80207ff8`、
+`pte = 0x200000cf`、`ppn = 0x80000`。该 PTE 是有效叶节点，最终得到：
+
+```text
+虚拟地址 0xffffffffc0298548 -> 物理地址 0x80298548
+prot = 7，返回值 = 0
+```
+
+结果也符合内核线性映射：`0xffffffffc0298548 - 0xffffffff40000000 =
+0x80298548`。因此通过 GDB 验证了一个具体访存地址如何经过 QEMU 的 Sv39
+页表查询转换为物理地址。
+
+#### 3. QEMU 中的 TLB 查找代码
+
+QEMU 的软件 TLB 查找位于 `accel/tcg/cputlb.c` 的 `load_helper()`。它根据
+`mmu_idx` 和虚拟地址计算索引，读取 `CPUTLBEntry`，再用 `tlb_hit()` 判断
+当前项是否覆盖目标虚拟页。未命中时调用 `tlb_fill()`，再由 RISC-V 后端的
+`riscv_cpu_tlb_fill()` 调用 `get_physical_address()`。转换成功后，
+`tlb_set_page()` 将页对齐的映射写入 TLB。
+
+在本次调试中，首次访问命中 `load_helper()` 断点时 `tlb_addr` 为无效值；
+随后命中 `get_physical_address()` 和 `tlb_set_page()` 断点。第二次访问同一
+地址时没有再次命中这两个断点，证明软件 TLB 的缓存路径确实生效。
+
+#### 4. QEMU TLB 与真实 CPU TLB 的区别
+
+二者的逻辑作用相同：都缓存虚拟页号到物理页帧号的映射，访问命中时跳过
+页表遍历，未命中时重新进行地址转换。区别在于真实 CPU 使用硬件 TLB，查找
+和替换由处理器电路完成；QEMU 使用 `CPUTLBEntry`、索引计算、条件判断和
+`tlb_set_page()` 等 C 代码模拟这一过程。
+
+为对比关闭分页的情况，调试了启动早期 `sd a0,0(t0)` 对 `0x80208000` 的
+存储访问。此时 `satp = 0`、`vm = 0`，QEMU 进入 Bare 分支，直接令
+`*physical = addr`，实际观察到 `0x80208000 -> 0x80208000`，然后仍将
+恒等映射写入软件 TLB。Bare 模式没有 SATP 根页表和 PTE 遍历，这也是它与
+Sv39 路径的主要差异。
+
+#### 5. 调试中的细节和收获
+
+双 GDB 调试时，RISC-V GDB 控制客体内核，普通 GDB 控制 QEMU 进程。主机
+GDB 命中断点会暂停整个模拟器，客体 GDB 的单步必须等待 QEMU 继续运行；
+因此需要交替使用两个会话。源码断点停在某一行时，还要用 `next`、`until`
+或寄存器值确认该行是否已经执行，不能只看当前源码行。
+
+本次还观察到页表项的页对齐映射与实际访问地址的页内偏移是分开的：
+`tlb_set_page()` 写入的是 `0xffffffffc0298000 -> 0x80298000`，而实际加载
+地址的偏移 `0x548` 在最终内存访问时保留。这个过程把“页表转换”和“页内
+偏移拼接”具体展示出来。
+
+#### 6. AI 辅助调试过程
+
+调试前使用大模型确认了两个 GDB 的职责、带调试信息 QEMU 的构建方式以及
+条件断点的设置方法。随后根据实验指导书中的调用路径，在 QEMU 源码中定位
+`load_helper()`、`get_physical_address()` 和 `tlb_set_page()`，再用实际日志
+校正断点位置和参数。调试中出现 QEMU 因 SIGPIPE 停止的问题后，通过设置
+`handle SIGPIPE nostop noprint pass` 解决；遇到源码行与寄存器状态不同步时，
+通过单步和变量打印确认真实执行顺序。最终日志显示：
+
+```text
+[Dual GDB] Sv39 walk, TLB fill, and warm load PASS
+[Dual GDB] Bare identity translation and software TLB fill PASS
+```
+
+这次调试的结论不是只依赖模型解释，而是用 QEMU 源码断点、GDB 变量值和
+实际地址转换结果完成了验证。
+
+#### 7. 可复现的完整调试过程与截图位置
+
+下面的流程按照实验指导书的双重 GDB 思路整理，目标是让一次具体的内核访存依次经过“查 TLB、遍历 Sv39 页表、填充软件 TLB、再次访问命中”四个阶段，并额外对比关闭分页后的 Bare 模式。调试时需要三个终端：终端 1 启动 QEMU，终端 2 调试 QEMU 本身，终端 3 使用 RISC-V GDB 调试 ucore。
+
+##### 7.1 准备带调试信息的 QEMU
+
+实验指导书要求使用带调试信息的 QEMU 源码版本。进入 QEMU 4.1.1 源码目录执行：
 
 ```bash
-cd /path/to/qemu-4.1.1
 make distclean
 ./configure --target-list=riscv64-softmmu --enable-debug
 make -j$(nproc)
 ```
 
-编译完成后不要执行 `sudo make install`。记录调试版 QEMU 的绝对路径：
+编译完成后不要执行 `sudo make install`。直接使用源码目录下生成的
+`riscv64-softmmu/qemu-system-riscv64`，这样不会替换系统原有 QEMU。假设这个文件的绝对路径记为：
 
 ```text
 /path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64
 ```
 
-再进入本实验工程编译内核：
+当前工程的 `Makefile` 支持通过命令行变量覆盖 QEMU 路径，因此不需要永久修改 Makefile。先在 ucore 工程目录编译内核：
 
 ```bash
 cd /path/to/OS_2026/code
@@ -1297,22 +1398,18 @@ make clean
 make -j2
 ```
 
-**【截图 1 插入位置】**：在 QEMU 和内核都编译完成后截图，画面中应能看到 `make -j$(nproc)`、`make -j2` 的完成输出，以及调试版 `qemu-system-riscv64` 文件路径。
+##### 7.2 三个终端的启动顺序
 
-##### 2. 启动 QEMU 并建立双重 GDB 环境
-
-需要打开三个终端窗口。
-
-**终端 1：启动暂停的 QEMU。**
+**终端 1：启动暂停的 QEMU。** 使用调试版 QEMU，并让 QEMU 在第一条客体指令执行前暂停：
 
 ```bash
 cd /path/to/OS_2026/code
 make QEMU=/path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64 debug
 ```
 
-`debug` 目标会使用 `-s -S` 启动 QEMU：1234 端口用于客体 GDB，客体 CPU 在连接 GDB 前保持暂停。
+此时终端 1 通常没有继续输出，因为 Makefile 中的 `debug` 目标包含 `-s -S`：`-s` 在 1234 端口开启客体 GDB stub，`-S` 让客体 CPU 保持暂停。
 
-**终端 2：调试 QEMU 进程。**
+**终端 2：附加到 QEMU 进程。** 新开一个终端查找进程并启动宿主机 GDB：
 
 ```bash
 pgrep -af qemu-system-riscv64
@@ -1324,59 +1421,49 @@ gdb /path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64
 ```gdb
 set pagination off
 set breakpoint pending on
-attach <QEMU进程PID>
+attach <上一步查到的QEMU进程PID>
 handle SIGPIPE nostop noprint pass
 continue
 ```
 
-这里使用普通的宿主机 `gdb`，因为调试目标是本机运行的 QEMU 进程。
+这里使用普通的宿主机 `gdb`，因为调试目标是运行在本机上的 QEMU 进程；它与终端 3 的 `riscv64-unknown-elf-gdb` 不是同一个调试目标。此处必须先执行 `continue`，解除宿主机 GDB 对 QEMU 进程的暂停；QEMU 虽然继续运行，但由于启动参数含有 `-S`，客体 CPU 仍保持暂停，正好等待终端 3 连接。
 
-**终端 3：调试 ucore 内核。**
+**终端 3：连接客体内核。** 在工程目录执行：
 
 ```bash
 cd /path/to/OS_2026/code
 make gdb
 ```
 
-该命令使用 `riscv64-unknown-elf-gdb` 加载 `bin/kernel` 并连接 `localhost:1234`。如果没有自动停在 `kern_init`，在终端 3 执行：
+该命令使用 `riscv64-unknown-elf-gdb` 加载 `bin/kernel`，并连接 QEMU 的 `localhost:1234`。如果 `tools/gdbinit` 中的 `break kern_init` 生效，终端 3 会停在 `kern_init`；如果没有自动停下，手动执行：
 
 ```gdb
 break kern_init
 continue
 ```
 
-**【截图 2 插入位置】**：三个终端建立连接后截图。终端 2 应显示已经附加 QEMU，终端 3 应显示已经连接远程目标并停在 `kern_init` 或内核启动代码。
+此时可以在终端 3 截取第一张图。截图应同时包含：终端 2 已经附加 QEMU、终端 3 已连接 `localhost:1234`，并且客体停在 `kern_init` 或内核启动代码中。这张图用于证明双重 GDB 调试环境建立成功。
 
-##### 3. 在客体 GDB 中确定目标访存地址
+##### 7.3 在客体 GDB 中确定要观察的访存地址
 
-当前工程的 Buddy System 中有 `buddy_free_count`，它会在页分配器检查过程中被读取。先在终端 3 中查看该变量的虚拟地址，并反汇编读取它的函数：
+为了避免把地址写死，先在终端 3 中获取本次编译结果的真实地址。当前工程的 Buddy System 中有全局静态变量 `buddy_free_count`，它会在 `buddy_check()` 和 `buddy_nr_free_pages()` 路径中被读取，适合作为 Sv39 数据访存目标。在终端 3 执行：
 
 ```gdb
 print/x &buddy_free_count
 disassemble /m buddy_nr_free_pages
 ```
 
-在反汇编中找到读取 `buddy_free_count` 的 `ld` 指令，记录该指令地址，并查看对应指令：
+找到 `return buddy_free_count` 对应的加载指令，记录该加载指令的地址，并观察下一条指令：
 
 ```gdb
-x/4i <读取buddy_free_count的指令地址>
-break *<读取buddy_free_count的指令地址>
+x/i <加载指令地址>
+x/4i <加载指令地址>
+break *<加载指令地址>
 ```
 
-将变量地址记为 `<VA>`，将其所在页按 4 KiB 对齐后的地址记为 `<PAGE_VA>`。例如，如果 GDB 输出：
+在当前报告已有的一次运行中，目标数据虚拟地址为 `0xffffffffc0298548`，所在页的起始地址为 `0xffffffffc0298000`；实际地址可能因代码长度、编译器布局或修改内容发生变化，因此应以终端 3 的 `print/x &buddy_free_count` 输出为准。此时截取第二张图，内容应包含变量虚拟地址、对应的加载指令和客体断点位置。
 
-```text
-&buddy_free_count = 0xffffffffc0298548
-```
-
-则：
-
-```text
-<VA>      = 0xffffffffc0298548
-<PAGE_VA> = 0xffffffffc0298000
-```
-
-如果编译器没有保留 `buddy_nr_free_pages()` 的独立符号，可以在终端 3 执行：
+如果编译器把 `buddy_free_count` 优化进其他函数，使用下面的替代路径：
 
 ```gdb
 break buddy_check
@@ -1384,15 +1471,17 @@ continue
 disassemble /m buddy_check
 ```
 
-然后从 `buddy_check()` 的反汇编中选择一条明确读取内核高地址数据的 `ld` 指令。
+在反汇编中选择一个明确读取内核高地址数据的 `ld` 指令作为目标。关键要求是：该指令必须是数据加载或存储，而不是只改变寄存器的算术指令，这样终端 2 才能观察到 QEMU 的 MMU 数据访存路径。
 
-**【截图 3 插入位置】**：终端 3 中同时显示 `&buddy_free_count` 的虚拟地址、目标加载指令、指令地址和客体断点。
+##### 7.4 在 QEMU GDB 中设置 TLB 和页表断点
 
-##### 4. 在 QEMU 中设置 TLB 和页表断点
+终端 3 连接并停在 `kern_init` 后，先在终端 3 确定目标访存地址和加载指令。此时回到终端 2，使用 `Ctrl-C` 暂停正在运行的 QEMU 宿主进程，重新获得宿主机 GDB 提示符：
 
-目标地址确定后，回到终端 2。若终端 2 当前正在运行 QEMU，按一次 `Ctrl-C` 暂停宿主机 GDB；如果已经回到 GDB 提示符，直接继续执行下面的命令。
+```gdb
+Ctrl-C
+```
 
-将 `<VA>` 和 `<PAGE_VA>` 替换为终端 3 中得到的实际值：
+如果终端 2 因 QEMU 收到客体 GDB 的暂停信号已经自动回到提示符，则不必再次执行 `Ctrl-C`。然后在终端 2 设置三个关键断点。将 `<VA>` 替换为终端 3 得到的目标虚拟地址，将 `<PAGE_VA>` 替换为该地址按页对齐后的结果：
 
 ```gdb
 break load_helper
@@ -1405,7 +1494,7 @@ break tlb_set_page
 condition 3 vaddr == <PAGE_VA>
 ```
 
-当前一次运行可以使用下面的地址作为示例，实际运行时以终端 3 的输出为准：
+当前一次运行使用的示例命令如下：
 
 ```gdb
 break load_helper
@@ -1416,7 +1505,9 @@ break tlb_set_page
 condition 3 vaddr == 0xffffffffc0298000
 ```
 
-如果条件断点提示参数名不存在，先使用无条件断点查看参数：
+`load_helper()` 位于 QEMU 的 `accel/tcg/cputlb.c`，负责普通访存的 TLB 快速路径；`get_physical_address()` 位于 RISC-V 地址转换代码中，负责 Sv39 页表遍历；`tlb_set_page()` 负责把转换结果写入 QEMU 的软件 TLB。不同 QEMU 4.1.1 打包版本的源码行号可能不同，所以报告中使用函数名和条件断点，不依赖固定行号。
+
+如果某个条件断点提示参数名不存在，先删除该断点并设置无条件断点查看真实参数：
 
 ```gdb
 delete 1
@@ -1426,46 +1517,39 @@ info args
 info locals
 ```
 
-再按照 `info args` 显示的实际参数名重新设置条件。断点函数的作用分别是：`load_helper()` 观察 TLB 查找，`get_physical_address()` 观察 Sv39 页表遍历，`tlb_set_page()` 观察软件 TLB 回填。
+根据 `info args` 中实际显示的参数名重新设置 `condition`。常见版本中 `load_helper()` 和 `get_physical_address()` 使用 `addr`，`tlb_set_page()` 使用 `vaddr`；最终以本机 QEMU 源码的调试信息为准。
 
-**【截图 4 插入位置】**：终端 2 中显示三个条件断点已经设置成功，断点位置分别位于 `load_helper()`、`get_physical_address()` 和 `tlb_set_page()`。
+##### 7.5 观察第一次访问：TLB 未命中
 
-##### 5. 观察第一次访问：TLB 未命中
-
-回到终端 3 执行：
+在终端 3 继续执行客体：
 
 ```gdb
 continue
 ```
 
-终端 2 应首先停在 `load_helper()`。在终端 2 中执行：
+终端 2 应首先停在 `load_helper()`。在终端 2 输入：
 
 ```gdb
 backtrace 5
 info args
 info locals
 print/x addr
-```
-
-查看当前 TLB 项的读地址字段。不同 QEMU 源码版本的变量名可能不同，先通过 `info locals` 找到对应的 TLB 项，再执行类似命令：
-
-```gdb
 print/x entry->addr_read
 ```
 
-如果该字段为无效值（常见为 `0xffffffffffffffff`），说明目标虚拟页没有命中软件 TLB。随后 QEMU 会进入 `tlb_fill()`，再调用 RISC-V 后端的 `riscv_cpu_tlb_fill()` 和 `get_physical_address()`。
+如果当前版本没有 `entry` 这个局部变量，就使用 `info locals` 中显示的 TLB 项变量；重点观察目标虚拟页对应的 `addr_read` 是否为无效值（常见输出为 `0xffffffffffffffff`）。无效值表示当前虚拟页没有可用的 TLB 读映射，QEMU 将进入 `tlb_fill()`，再调用 RISC-V 后端的 `riscv_cpu_tlb_fill()` 和 `get_physical_address()`。
 
-**【截图 5 插入位置】**：终端 2 停在 `load_helper()` 时截图，画面中应包含目标虚拟地址、无效的 TLB 项字段和调用栈，用于证明第一次访问发生了 TLB 未命中。
+此时截取第三张图。截图至少要包含 `load_helper()` 的源码位置、目标 `addr`、TLB 项的无效状态和调用栈。它对应实验指导书要求的“先查 TLB，并观察 TLB miss”。
 
-##### 6. 单步观察 Sv39 三级页表遍历
-
-在终端 2 继续执行到页表翻译断点：
+继续到页表翻译断点：
 
 ```gdb
 continue
 ```
 
-停在 `get_physical_address()` 后，先记录地址转换参数和页表配置：
+##### 7.6 观察 Sv39 三级页表遍历
+
+终端 2 停在 `get_physical_address()` 后，先记录函数参数和关键局部变量：
 
 ```gdb
 backtrace 6
@@ -1478,7 +1562,9 @@ print ptidxbits
 print ptesize
 ```
 
-在页表遍历循环中使用 `next` 单步，每一级记录以下变量：
+对于当前工程，`satp` 的高 4 位 MODE 应为 8，表示 Sv39；低位 PPN 给出根页表物理页号。报告已有一次运行得到 `env->satp = 0x8000000000080207`，根页表物理地址为 `0x80207000`，但你应以本次 GDB 输出为准。
+
+在 `get_physical_address()` 的页表遍历循环处使用 `next` 单步。每次循环重点记录以下变量：
 
 ```gdb
 print/x idx
@@ -1488,9 +1574,11 @@ print/x ppn
 next
 ```
 
-当 `R/W/X` 权限位均为 0 时，当前 PTE 是下一级页表地址，继续下一轮；当权限位出现有效值时，当前 PTE 是叶节点，页表遍历结束。Sv39 每级使用 9 位 VPN 索引，PTE 大小为 8 字节。
+每一级的含义是：从虚拟地址提取当前级 VPN 索引，用 `pte_addr = base + idx * ptesize` 定位 PTE，读取 PTE 后检查 `PTE_V` 和权限位。如果 `R/W/X` 全为 0，当前 PTE 是下一级页表的指针；如果权限位中至少有一个有效，当前 PTE 就是叶节点，遍历结束。对 Sv39 来说，三级索引分别对应 VPN[2]、VPN[1]、VPN[0]，每级索引 9 位，PTE 大小 8 字节。
 
-在叶节点已经确定、物理地址即将返回时执行：
+当看到有效叶节点、`ppn` 已经确定并且代码即将计算物理地址时截取第四张图。截图应包含 `satp`、当前级索引、PTE 地址、PTE 原始值和最终叶节点信息。当前已有运行中的示例为 `pte_addr = 0x80207ff8`、`pte = 0x200000cf`、`ppn = 0x80000`。
+
+在函数即将返回或返回后记录：
 
 ```gdb
 print/x *physical
@@ -1498,29 +1586,27 @@ print/x prot
 print/x ret
 ```
 
-对于示例地址，最终转换关系应为：
+对于示例目标，预期转换关系是：
 
 ```text
 VA 0xffffffffc0298548 -> PA 0x80298548
 ```
 
-页内偏移 `0x548` 保持不变，也可以用线性映射偏移核对：
+页内偏移 `0x548` 不参与页号转换，而是从虚拟地址原样拼接到物理页基址 `0x80298000` 后面。也可以用内核线性映射再次核对：
 
 ```text
 0xffffffffc0298548 - 0xffffffff40000000 = 0x80298548
 ```
 
-**【截图 6 插入位置】**：终端 2 停在 `get_physical_address()` 的叶节点处理位置时截图，画面中应包含 `satp`、当前级索引、PTE 地址、PTE 值、`ppn` 和最终物理地址。
+##### 7.7 观察 TLB 回填
 
-##### 7. 观察软件 TLB 回填
-
-在终端 2 执行：
+在终端 2 继续执行到 `tlb_set_page()`：
 
 ```gdb
 continue
 ```
 
-程序应停在 `tlb_set_page()`。执行：
+在断点处执行：
 
 ```gdb
 backtrace 5
@@ -1528,68 +1614,53 @@ info args
 info locals
 print/x vaddr
 print/x paddr
-```
-
-如果当前版本存在缓存项变量，再查看其内容：
-
-```gdb
 print/x $cached_entry->addr_read
 print/x $cached_entry->addend
 ```
 
-此处应看到页对齐后的映射，例如：
+不同源码版本的局部变量名称可能不同，使用 `info locals` 找到实际的缓存项变量。这里应看到页对齐的映射，例如：
 
 ```text
 virtual page: 0xffffffffc0298000
 physical page: 0x0000000080298000
 ```
 
-这里显示的是页基址，真正的加载地址还要加上页内偏移 `0x548`。
+注意这里显示的是页基址，不是完整的 `0xffffffffc0298548 -> 0x80298548`。页内偏移 `0x548` 会在真正的加载指令执行时重新拼接。此时截取第五张图，截图应包含 `tlb_set_page()`、虚拟页基址、物理页基址和软件 TLB 缓存项。
 
-**【截图 7 插入位置】**：终端 2 停在 `tlb_set_page()` 时截图，画面中应包含虚拟页基址、物理页基址和软件 TLB 缓存项。
+##### 7.8 观察第二次访问的 TLB 命中
 
-##### 8. 观察第二次访问：TLB 命中
-
-继续运行终端 2 和终端 3，使同一虚拟页再次被访问：
+让终端 2 和终端 3 继续运行，使同一虚拟页再次被访问：
 
 ```gdb
-# 终端 2
+# 终端2
 continue
 
-# 终端 3：在目标加载指令处继续执行
+# 终端3：回到目标加载指令后再次执行
 continue
 ```
 
-第二次访问应再次经过 `load_helper()`，但不再进入 `get_physical_address()` 和 `tlb_set_page()`。终端 2 停在 `load_helper()` 后执行：
+第二次访问如果使用同一虚拟页，应再次进入 `load_helper()`，但不再进入 `get_physical_address()` 和 `tlb_set_page()`。在终端 2 的 `load_helper()` 断点处执行：
 
 ```gdb
 print/x addr
-info locals
 print/x entry->addr_read
 backtrace 5
 ```
 
-如果 `entry->addr_read` 已经覆盖目标页，并且页表遍历和 TLB 回填断点没有再次命中，则说明第二次访问使用了已经填充的软件 TLB。
+此时 `entry->addr_read` 应覆盖目标页，调用路径直接走 TLB 命中和实际内存访问。截取第六张图，截图应体现第二次访问仍有 `load_helper()`，但页表遍历和 TLB 回填断点没有再次命中。该图对应实验指导书要求的“比较 TLB miss 与 warm load”。
 
-**【截图 8 插入位置】**：终端 2 第二次停在 `load_helper()` 时截图，画面中应显示目标页已经命中 TLB，且没有重新进入 `get_physical_address()` 和 `tlb_set_page()`。
+##### 7.9 Bare 模式对比
 
-##### 9. 观察 Bare 模式地址转换
-
-Bare 模式需要重新启动一次 QEMU，使调试回到 `satp` 写入之前。终止当前 QEMU 后，在终端 1 重新执行：
-
-```bash
-make QEMU=/path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64 debug
-```
-
-按照第 2 步重新连接终端 2 和终端 3。终端 3 中执行：
+最后对比分页关闭时的路径。终端 3 可以从 `kern_entry` 开始观察启动代码中 `csrw satp` 之前的访存，或者在启动早期选择一条确定的物理地址存储指令。终端 3 执行：
 
 ```gdb
+delete
 break kern_entry
 continue
 disassemble /m kern_entry
 ```
 
-找到 `csrw satp` 之前的 `sd` 访存指令，在该指令处设置断点：
+找到 `csrw satp` 之前的 `sd` 指令后，在该指令地址设置断点并单步：
 
 ```gdb
 break *<csrw satp之前的访存指令地址>
@@ -1599,16 +1670,7 @@ info registers satp
 si
 ```
 
-在终端 2 的 QEMU GDB 中保留或重新设置 `get_physical_address()` 断点。当该访存触发时，查看：
-
-```gdb
-info args
-info locals
-print/x addr
-print/x *physical
-```
-
-此时 `satp` 为 0，QEMU 进入 Bare 分支，直接令物理地址等于输入地址，不进行 Sv39 页表遍历。例如访问 `0x80208000` 时应观察到：
+此时 `satp` 为 0，QEMU 的地址转换函数会进入 Bare 分支，直接执行 `*physical = addr`，不会读取根页表，也不会执行 Sv39 的三级索引循环。若访问地址是 `0x80208000`，预期观察到：
 
 ```text
 satp = 0
@@ -1616,7 +1678,35 @@ vm = 0
 VA 0x80208000 -> PA 0x80208000
 ```
 
-**【截图 9 插入位置】**：终端 2 停在 Bare 分支时截图，画面中应包含 `satp=0`、Bare 分支、输入地址和输出物理地址。
+截取第七张图，内容应包含 `satp=0`、Bare 分支源码位置和虚拟地址等于物理地址的结果。最后在报告中用一段话比较：真实 CPU 使用硬件 TLB 和硬件页表遍历，而 QEMU 用 `CPUTLBEntry`、C 代码条件判断和 `tlb_set_page()` 模拟相同的逻辑；Bare 模式则绕过 SATP 和页表遍历。
+
+##### 7.10 截图清单
+
+建议最终保留以下七张截图，截图中的终端提示符、命令和关键输出应清晰可读：
+
+| 截图 | 应包含的内容 | 对应证明 |
+|------|--------------|----------|
+| 1 | 三终端建立，终端 3 停在 `kern_init` | 双重 GDB 环境建立成功 |
+| 2 | 客体 GDB 中的目标虚拟地址、加载指令和断点 | 确定被观察的访存 |
+| 3 | `load_helper()`、TLB 项无效值和调用栈 | TLB 未命中 |
+| 4 | `get_physical_address()` 中的 `satp`、索引、PTE 和叶节点 | Sv39 三级页表遍历 |
+| 5 | `tlb_set_page()` 中的虚拟页基址和物理页基址 | 软件 TLB 回填 |
+| 6 | 第二次访问时 TLB 项有效且未重新进入页表遍历 | TLB 命中 |
+| 7 | `satp=0` 的 Bare 分支和恒等地址转换 | 分页开启与关闭的路径差异 |
+
+如果某一步停在系统库源码、`SIGPIPE` 或 `poll()`，先确认终端 2 已执行 `handle SIGPIPE nostop noprint pass`，再用 `continue` 回到设置的条件断点。不要把系统库停顿截图作为实验结果，实验截图应以 QEMU 的 `load_helper()`、`get_physical_address()`、`tlb_set_page()` 和 Bare 分支源码为主体。
+
+#### 8. 是否需要把默认分配器改成 Best-Fit
+
+**进行 GDB 页表调试时不需要把默认分配方式改成 Best-Fit。** 当前工程的 `pmm.c` 已将默认管理器设置为 `buddy_pmm_manager`，而 `kern_init()` 在 `pmm_init()` 完成后还会初始化并检查 SLUB；保持 Buddy System 可以直接复用当前能够启动和运行 SLUB 的配置。页表查询、TLB 查找和地址转换发生在 QEMU 的模拟 MMU 中，与物理页分配器选择 Best-Fit 还是 Buddy System 没有直接关系。
+
+Best-Fit 只在完成 Best-Fit 任务和评分时切换。实验指导书明确要求 Best-Fit 任务完成后在 `pmm.c` 的 `init_pmm_manager()` 中选择 `best_fit_pmm_manager`，否则运行的仍是 First-Fit 或当前默认管理器；因此可以采用下面的分工：
+
+1. **Best-Fit 评分阶段：** 临时将 `pmm_manager = &best_fit_pmm_manager;`，运行 `make grade` 或对应 Best-Fit 测试，确认 `Page Init` 和 `Best-Fit` 结果。
+2. **Buddy、SLUB 和 GDB 阶段：** 恢复为 `pmm_manager = &buddy_pmm_manager;`，重新编译后执行上述调试流程。
+3. **报告说明：** 明确写出 Best-Fit 评分使用独立配置，默认启动、Buddy、SLUB 和 GDB 调试使用 Buddy 配置；不需要为了 GDB 调试再次切换分配器。
+
+切换管理器只影响内核初始化时页面如何组织和分配，不改变 `satp`、启动页表、Sv39 索引和 QEMU 的 `load_helper()` 调用路径。因此，GDB 调试报告中的地址转换证据应以当前可启动的 Buddy 配置为准。
 
 ---
 
@@ -1627,6 +1717,7 @@ VA 0x80208000 -> PA 0x80208000
 项目构建命令：
 
 ```bash
+cd lab2
 make -j2
 ```
 
@@ -1668,6 +1759,9 @@ Buddy 独立测试覆盖了初始化布局、按阶分配、块分裂、不同�
 
 SLUB 独立测试覆盖 31 个大小边界，包括类别边界、跨页大对象和资源不足场景；同时验证多个小对象共享 slab 页面、槽位复用、对象内容保护和空 slab 页面回收。1200 次随机分配释放和 10 项负向测试完成后，活动对象内容保持正确，底层空闲页数恢复。
 
+![双 GDB 调试记录](./images/terminal_debug.png)
+
+双 GDB 调试截图记录了 Sv39 页表查询、软件 TLB 填充、重复访问以及 Bare 模式恒等映射路径。调试结果同时观察到页表转换和 TLB 命中过程，日志中的两条验证路径均显示 `PASS`，从执行路径上对应了报告中的地址转换分析。
 
 ---
 
