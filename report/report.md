@@ -1270,222 +1270,356 @@ Requirements：不能只验证返回值非空；同时验证对象层与物理�
 
 **负责人：** 2412940-曹皓轩
 
-本实验使用客体 GDB 控制 uCore 内核执行，使用宿主机 GDB 检查 QEMU 的 RISC-V 地址翻译过程。调试目标是变量 `buddy_free_count` 的首次写入、Sv39 页表遍历、软件 TLB 回填，以及 `satp=0` 时的 Bare 模式地址转换。
+#### 调试步骤
 
-#### 建立调试会话
+##### 1. 准备带调试信息的 QEMU 并编译内核
 
-QEMU 以暂停 CPU 的方式启动，`-s` 开启供客体 GDB 连接的 `localhost:1234` 服务，`-S` 在 GDB 连接前暂停虚拟 CPU：
-
-```bash
-cd /home/student/homework/os/OS_2026/code
-/tmp/qemu-6.2-debug-build/qemu-system-riscv64 -machine virt -nographic -bios default -kernel /home/student/homework/os/OS_2026/code/bin/ucore.img -s -S
-```
-
-宿主机 GDB 附加到 QEMU 进程，用于检查 QEMU 内部的页表遍历和 TLB 操作：
+进入 QEMU 4.1.1 源码目录，编译带调试信息的 RISC-V QEMU：
 
 ```bash
-QEMU_PID=$(ps -C qemu-system-ris -o pid= | head -n1 | tr -d ' ')
-gdb -q /tmp/qemu-6.2-debug-build/qemu-system-riscv64 -ex 'set pagination off' -ex "attach $QEMU_PID"
+cd /path/to/qemu-4.1.1
+make distclean
+./configure --target-list=riscv64-softmmu --enable-debug
+make -j$(nproc)
 ```
+
+编译完成后不要执行 `sudo make install`。记录调试版 QEMU 的绝对路径：
+
+```text
+/path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64
+```
+
+再进入本实验工程编译内核：
+
+```bash
+cd /path/to/OS_2026/code
+make clean
+make -j2
+```
+
+**【截图 1 插入位置】**：在 QEMU 和内核都编译完成后截图，画面中应能看到 `make -j$(nproc)`、`make -j2` 的完成输出，以及调试版 `qemu-system-riscv64` 文件路径。
+
+##### 2. 启动 QEMU 并建立双重 GDB 环境
+
+需要打开三个终端窗口。
+
+**终端 1：启动暂停的 QEMU。**
+
+```bash
+cd /path/to/OS_2026/code
+make QEMU=/path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64 debug
+```
+
+`debug` 目标会使用 `-s -S` 启动 QEMU：1234 端口用于客体 GDB，客体 CPU 在连接 GDB 前保持暂停。
+
+**终端 2：调试 QEMU 进程。**
+
+```bash
+pgrep -af qemu-system-riscv64
+gdb /path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64
+```
+
+在宿主机 GDB 中执行：
 
 ```gdb
+set pagination off
+set breakpoint pending on
+attach <QEMU进程PID>
 handle SIGPIPE nostop noprint pass
 continue
 ```
 
-客体 GDB 加载内核符号并连接 QEMU GDB stub，在 `kern_init` 处停止：
+这里使用普通的宿主机 `gdb`，因为调试目标是本机运行的 QEMU 进程。
+
+**终端 3：调试 ucore 内核。**
 
 ```bash
-cd /home/student/homework/os/OS_2026/code
-riscv64-unknown-elf-gdb -q bin/kernel
+cd /path/to/OS_2026/code
+make gdb
 ```
 
+该命令使用 `riscv64-unknown-elf-gdb` 加载 `bin/kernel` 并连接 `localhost:1234`。如果没有自动停在 `kern_init`，在终端 3 执行：
+
 ```gdb
-set arch riscv:rv64
-target remote localhost:1234
 break kern_init
 continue
 ```
 
-连接结果停在 `kern_init()`，为内核初始化和后续目标访存提供了调试起点。
+**【截图 2 插入位置】**：三个终端建立连接后截图。终端 2 应显示已经附加 QEMU，终端 3 应显示已经连接远程目标并停在 `kern_init` 或内核启动代码。
 
-![QEMU 与宿主机、客体 GDB 调试会话](./images/gdb2.png)
+##### 3. 在客体 GDB 中确定目标访存地址
 
-#### 定位目标访存并设置断点
-
-客体 GDB 查看 `buddy_free_count` 的地址和读取指令，并在该指令处设置断点：
+当前工程的 Buddy System 中有 `buddy_free_count`，它会在页分配器检查过程中被读取。先在终端 3 中查看该变量的虚拟地址，并反汇编读取它的函数：
 
 ```gdb
 print/x &buddy_free_count
 disassemble /m buddy_nr_free_pages
-x/4i 0xffffffffc020057a
-break *0xffffffffc020057a
 ```
 
-目标变量地址为 `0xffffffffc0298548`，所在虚拟页为 `0xffffffffc0298000`。指令 `0xffffffffc020057a` 是对该变量的 `ld` 访问。
-
-![目标变量地址、反汇编和客体断点](./images/gdb3.png)
-
-宿主机 GDB 在 QEMU 中设置四个条件断点，分别观察 TLB 未命中处理、物理地址查询、TLB 回填及页表查询返回：
+在反汇编中找到读取 `buddy_free_count` 的 `ld` 指令，记录该指令地址，并查看对应指令：
 
 ```gdb
-break riscv_cpu_tlb_fill
-condition 1 address >= 0xffffffffc0298000 && address < 0xffffffffc0299000
+x/4i <读取buddy_free_count的指令地址>
+break *<读取buddy_free_count的指令地址>
+```
+
+将变量地址记为 `<VA>`，将其所在页按 4 KiB 对齐后的地址记为 `<PAGE_VA>`。例如，如果 GDB 输出：
+
+```text
+&buddy_free_count = 0xffffffffc0298548
+```
+
+则：
+
+```text
+<VA>      = 0xffffffffc0298548
+<PAGE_VA> = 0xffffffffc0298000
+```
+
+如果编译器没有保留 `buddy_nr_free_pages()` 的独立符号，可以在终端 3 执行：
+
+```gdb
+break buddy_check
+continue
+disassemble /m buddy_check
+```
+
+然后从 `buddy_check()` 的反汇编中选择一条明确读取内核高地址数据的 `ld` 指令。
+
+**【截图 3 插入位置】**：终端 3 中同时显示 `&buddy_free_count` 的虚拟地址、目标加载指令、指令地址和客体断点。
+
+##### 4. 在 QEMU 中设置 TLB 和页表断点
+
+目标地址确定后，回到终端 2。若终端 2 当前正在运行 QEMU，按一次 `Ctrl-C` 暂停宿主机 GDB；如果已经回到 GDB 提示符，直接继续执行下面的命令。
+
+将 `<VA>` 和 `<PAGE_VA>` 替换为终端 3 中得到的实际值：
+
+```gdb
+break load_helper
+condition 1 addr == <VA>
+
 break get_physical_address
-condition 2 addr >= 0xffffffffc0298000 && addr < 0xffffffffc0299000
+condition 2 addr == <VA> && access_type == 0
+
+break tlb_set_page
+condition 3 vaddr == <PAGE_VA>
+```
+
+当前一次运行可以使用下面的地址作为示例，实际运行时以终端 3 的输出为准：
+
+```gdb
+break load_helper
+condition 1 addr == 0xffffffffc0298548
+break get_physical_address
+condition 2 addr == 0xffffffffc0298548 && access_type == 0
 break tlb_set_page
 condition 3 vaddr == 0xffffffffc0298000
-break /tmp/qemu-6.2-debug-src/target/riscv/cpu_helper.c:687
-condition 4 addr >= 0xffffffffc0298000 && addr < 0xffffffffc0299000
-info break
 ```
 
-断点 1、2、4 覆盖目标 4 KiB 页，断点 3 匹配该页的虚拟基址。这个范围对应 `kern_init()` 中 `memset(edata, 0, end - edata)` 对目标页的首次写入；目标页内首次访存地址不必与变量首地址相同。
-
-![宿主机 GDB 中的条件断点](./images/gdb4.png)
-
-#### 跟踪首次写入和 Sv39 页表遍历
-
-宿主机 GDB 与客体 GDB 继续运行后，宿主机首先停在 `riscv_cpu_tlb_fill()`。参数显示此次访问位于目标页，访问类型为 `MMU_DATA_STORE`：
+如果条件断点提示参数名不存在，先使用无条件断点查看参数：
 
 ```gdb
+delete 1
+break load_helper
+continue
 info args
-print/x address
-print access_type
+info locals
 ```
 
-![目标页首次写访问](./images/gdb5.png)
+再按照 `info args` 显示的实际参数名重新设置条件。断点函数的作用分别是：`load_helper()` 观察 TLB 查找，`get_physical_address()` 观察 Sv39 页表遍历，`tlb_set_page()` 观察软件 TLB 回填。
 
-继续执行并在 `get_physical_address()` 的成功返回位置检查页表信息：
+**【截图 4 插入位置】**：终端 2 中显示三个条件断点已经设置成功，断点位置分别位于 `load_helper()`、`get_physical_address()` 和 `tlb_set_page()`。
+
+##### 5. 观察第一次访问：TLB 未命中
+
+回到终端 3 执行：
 
 ```gdb
 continue
-disable 2
-continue
-bt 8
+```
+
+终端 2 应首先停在 `load_helper()`。在终端 2 中执行：
+
+```gdb
+backtrace 5
 info args
+info locals
+print/x addr
+```
+
+查看当前 TLB 项的读地址字段。不同 QEMU 源码版本的变量名可能不同，先通过 `info locals` 找到对应的 TLB 项，再执行类似命令：
+
+```gdb
+print/x entry->addr_read
+```
+
+如果该字段为无效值（常见为 `0xffffffffffffffff`），说明目标虚拟页没有命中软件 TLB。随后 QEMU 会进入 `tlb_fill()`，再调用 RISC-V 后端的 `riscv_cpu_tlb_fill()` 和 `get_physical_address()`。
+
+**【截图 5 插入位置】**：终端 2 停在 `load_helper()` 时截图，画面中应包含目标虚拟地址、无效的 TLB 项字段和调用栈，用于证明第一次访问发生了 TLB 未命中。
+
+##### 6. 单步观察 Sv39 三级页表遍历
+
+在终端 2 继续执行到页表翻译断点：
+
+```gdb
+continue
+```
+
+停在 `get_physical_address()` 后，先记录地址转换参数和页表配置：
+
+```gdb
+backtrace 6
+info args
+info locals
 print/x addr
 print/x env->satp
+print levels
+print ptidxbits
+print ptesize
+```
+
+在页表遍历循环中使用 `next` 单步，每一级记录以下变量：
+
+```gdb
+print/x idx
 print/x pte_addr
 print/x pte
 print/x ppn
-set $physical_ptr = physical
-set $prot_ptr = prot
-finish
-x/gx $physical_ptr
-x/wx $prot_ptr
-print/x $rax
+next
 ```
 
-查询到的虚拟地址为 `0xffffffffc0298548`，`satp` 非零，页表项给出物理页 `0x80298000`。页内偏移 `0x548` 保持不变，最终物理地址为 `0x80298548`；权限值为 `0x7`，返回值 `0` 表示翻译成功。
+当 `R/W/X` 权限位均为 0 时，当前 PTE 是下一级页表地址，继续下一轮；当权限位出现有效值时，当前 PTE 是叶节点，页表遍历结束。Sv39 每级使用 9 位 VPN 索引，PTE 大小为 8 字节。
 
-![Sv39 页表遍历和地址转换结果](./images/gdb6.png)
+在叶节点已经确定、物理地址即将返回时执行：
 
-#### 观察软件 TLB 回填与命中
+```gdb
+print/x *physical
+print/x prot
+print/x ret
+```
 
-地址翻译完成后，宿主机 GDB 停在 `tlb_set_page()`。函数参数显示 QEMU 将虚拟页 `0xffffffffc0298000` 映射到物理页 `0x80298000`，页大小为 `4096` 字节：
+对于示例地址，最终转换关系应为：
+
+```text
+VA 0xffffffffc0298548 -> PA 0x80298548
+```
+
+页内偏移 `0x548` 保持不变，也可以用线性映射偏移核对：
+
+```text
+0xffffffffc0298548 - 0xffffffff40000000 = 0x80298548
+```
+
+**【截图 6 插入位置】**：终端 2 停在 `get_physical_address()` 的叶节点处理位置时截图，画面中应包含 `satp`、当前级索引、PTE 地址、PTE 值、`ppn` 和最终物理地址。
+
+##### 7. 观察软件 TLB 回填
+
+在终端 2 执行：
 
 ```gdb
 continue
-bt 6
+```
+
+程序应停在 `tlb_set_page()`。执行：
+
+```gdb
+backtrace 5
 info args
+info locals
 print/x vaddr
 print/x paddr
-print size
 ```
 
-![软件 TLB 页表项回填](./images/gdb7.png)
-
-关闭上述断点并继续执行后，目标加载指令再次访问同一页面。`info break` 显示断点命中次数保持不变，说明第二次访问由已填充的软件 TLB 完成，没有再次进入页表查询和回填路径：
+如果当前版本存在缓存项变量，再查看其内容：
 
 ```gdb
-disable 1 2 3 4
+print/x $cached_entry->addr_read
+print/x $cached_entry->addend
+```
+
+此处应看到页对齐后的映射，例如：
+
+```text
+virtual page: 0xffffffffc0298000
+physical page: 0x0000000080298000
+```
+
+这里显示的是页基址，真正的加载地址还要加上页内偏移 `0x548`。
+
+**【截图 7 插入位置】**：终端 2 停在 `tlb_set_page()` 时截图，画面中应包含虚拟页基址、物理页基址和软件 TLB 缓存项。
+
+##### 8. 观察第二次访问：TLB 命中
+
+继续运行终端 2 和终端 3，使同一虚拟页再次被访问：
+
+```gdb
+# 终端 2
+continue
+
+# 终端 3：在目标加载指令处继续执行
 continue
 ```
 
-客体 GDB 在目标加载指令处继续运行后，宿主机 GDB 中断并查看断点计数：
+第二次访问应再次经过 `load_helper()`，但不再进入 `get_physical_address()` 和 `tlb_set_page()`。终端 2 停在 `load_helper()` 后执行：
 
 ```gdb
+print/x addr
+info locals
+print/x entry->addr_read
+backtrace 5
+```
+
+如果 `entry->addr_read` 已经覆盖目标页，并且页表遍历和 TLB 回填断点没有再次命中，则说明第二次访问使用了已经填充的软件 TLB。
+
+**【截图 8 插入位置】**：终端 2 第二次停在 `load_helper()` 时截图，画面中应显示目标页已经命中 TLB，且没有重新进入 `get_physical_address()` 和 `tlb_set_page()`。
+
+##### 9. 观察 Bare 模式地址转换
+
+Bare 模式需要重新启动一次 QEMU，使调试回到 `satp` 写入之前。终止当前 QEMU 后，在终端 1 重新执行：
+
+```bash
+make QEMU=/path/to/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64 debug
+```
+
+按照第 2 步重新连接终端 2 和终端 3。终端 3 中执行：
+
+```gdb
+break kern_entry
 continue
+disassemble /m kern_entry
 ```
 
-宿主机 GDB 按 `Ctrl-C` 后执行：
+找到 `csrw satp` 之前的 `sd` 访存指令，在该指令处设置断点：
 
 ```gdb
-info break
-```
-
-![第二次访问命中软件 TLB](./images/gdb8.png)
-
-#### Bare 模式地址转换
-
-Bare 模式验证重新启动 QEMU，使访存发生在分页开启前。客体 GDB 执行：
-
-```gdb
-detach
-quit
-```
-
-宿主机 GDB 按 `Ctrl-C` 中断 QEMU，再执行：
-
-```gdb
-detach
-quit
-```
-
-QEMU 前台终端使用 `Ctrl-A`、`x` 退出。随后以 `-s -S` 重新启动 QEMU，客体 GDB 连接后在物理入口 `0x80200008` 设置断点：
-
-```bash
-cd /home/student/homework/os/OS_2026/code
-/tmp/qemu-6.2-debug-build/qemu-system-riscv64 -machine virt -nographic -bios default -kernel /home/student/homework/os/OS_2026/code/bin/ucore.img -s -S
-```
-
-```bash
-cd /home/student/homework/os/OS_2026/code
-riscv64-unknown-elf-gdb -q bin/kernel
-```
-
-```gdb
-set arch riscv:rv64
-target remote localhost:1234
-break *0x80200008
+break *<csrw satp之前的访存指令地址>
 continue
 x/i $pc
 info registers satp
-```
-
-宿主机 GDB 附加到已连接客体 GDB 的 QEMU，并对 `get_physical_address()` 的 Bare 模式地址设置条件断点：
-
-```bash
-QEMU_PID=$(ps -C qemu-system-ris -o pid= | head -n1 | tr -d ' ')
-gdb -q /tmp/qemu-6.2-debug-build/qemu-system-riscv64 -ex 'set pagination off' -ex "attach $QEMU_PID"
-```
-
-```gdb
-break get_physical_address
-condition 1 addr == 0x80208000
-continue
-```
-
-客体 GDB 在 `0x80200008` 单步后，宿主机 GDB 于 `get_physical_address()` 入口停下。记录输入地址、`satp` 和输出指针，再运行至函数返回并读取结果：
-
-```gdb
 si
 ```
 
+在终端 2 的 QEMU GDB 中保留或重新设置 `get_physical_address()` 断点。当该访存触发时，查看：
+
 ```gdb
 info args
+info locals
 print/x addr
-print/x env->satp
-set $physical_ptr = physical
-finish
-x/gx $physical_ptr
-print/x $rax
+print/x *physical
 ```
 
-结果为 `addr = 0x80208000`、`satp = 0`、输出物理地址 `0x80208000`、返回值 `0`。在 Bare 模式下，QEMU 将输入地址直接作为物理地址。
+此时 `satp` 为 0，QEMU 进入 Bare 分支，直接令物理地址等于输入地址，不进行 Sv39 页表遍历。例如访问 `0x80208000` 时应观察到：
 
-![Bare 模式地址转换结果](./images/gdb9.png)
+```text
+satp = 0
+vm = 0
+VA 0x80208000 -> PA 0x80208000
+```
+
+**【截图 9 插入位置】**：终端 2 停在 Bare 分支时截图，画面中应包含 `satp=0`、Bare 分支、输入地址和输出物理地址。
+
+---
+
 ## 五、测试与验证
 
 ### 编译与运行
