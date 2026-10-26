@@ -227,13 +227,13 @@ Requirements：
 2. 描述符数组起点按页向上对齐，可管理末端按页向下对齐，描述符自身占用的页面保留
 3. 仅在存在完整空闲页面时调用 `init_memmap()`；无效范围或描述符空间不足时通过 `panic()` 终止
 
-### Challenge：硬件可用物理内存范围的获取方法
+### Challenge：硬件的可用物理内存范围的获取方法（思考题）
 
-**负责人：** 2412940-曹皓轩
+如果 OS 事先不知道硬件的可用物理内存范围，可以在启动时读取固件或设备树提供的内存布局信息。RISC-V 系统通常通过设备树的 `memory` 节点传递内存范围，节点中的 `reg` 属性给出物理内存的起始地址和长度；x86 系统则可以读取 BIOS 的 E820 内存表或 UEFI 的内存映射表。
 
-处理器的物理地址空间可能包含设备寄存器、地址空洞和保留区域，因此不能仅凭地址可访问就判断它属于可分配 RAM。本实验通过启动环境传入的设备树获取内存范围：内核保存 DTB 地址，`dtb_init()` 解析 memory 节点的 `reg` 属性，供 `page_init()` 使用。
+本实验运行在 RISC-V/QEMU 环境中，OS 通过 DTB 获取内存范围。`dtb_init()` 解析 `memory/reg`，得到 DRAM 的起始地址和大小，再由 `page_init()` 排除固件、内核镜像和页描述符占用的区域，将剩余完整物理页交给页分配器。
 
-通用内核还需处理多段 RAM、设备区域和固件保留区。对每一段范围都应检查地址加法溢出、重叠和对齐，并只将完整可用页面交给分配器。直接向未知地址写入测试值可能破坏数据或触发设备操作，不适合作为通用内存探测方法。
+因此，本题的实现方法是：**由启动固件或设备树提供物理内存布局，OS 解析内存表获得可用范围，再将可用区间转换为页分配器管理的物理页。**
 
 ### 功能模块二任务一：理解 First-Fit 连续物理内存分配算法
 
@@ -1319,7 +1319,7 @@ break kern_init
 continue
 ```
 
-`target remote` 成功时，客体 GDB 会显示远程连接信息；`break kern_init` 应报告断点位置在 `kern/init/init.c`；`continue` 让 QEMU 从复位入口运行，直到命中 `kern_init()`。停下时的函数名、源文件和行号用于确认客体符号与 QEMU 的远程目标已经对应。`-S` 使 CPU 初始暂停，所以只有客体 GDB 执行 `continue` 后内核才开始启动。
+连接结果停在 `kern_init()`，为内核初始化和后续目标访存提供调试起点。
 
 ![QEMU 与宿主机、客体 GDB 调试会话](./images/gdb2.png)
 
@@ -1334,7 +1334,7 @@ x/4i 0xffffffffc020057a
 break *0xffffffffc020057a
 ```
 
-`print/x &buddy_free_count` 输出变量的虚拟地址 `0xffffffffc0298548`。Sv39 页大小为 4 KiB，因此该变量所在页的基址是 `0xffffffffc0298000`，页内偏移为 `0x548`。`disassemble /m` 将 C 源码与机器指令对应起来；`x/4i` 从给定地址显示四条指令，结果中的 `ld` 是 64 位加载指令，访问 `buddy_free_count`。`break *...` 在该机器指令地址设置断点，命中时客体 GDB 会停在执行该加载之前。
+目标变量地址为 `0xffffffffc0298548`，所在虚拟页为 `0xffffffffc0298000`。指令 `0xffffffffc020057a` 是对该变量的 `ld` 访问。
 
 ![目标变量地址、反汇编和客体断点](./images/gdb3.png)
 
@@ -1354,31 +1354,19 @@ condition 4 addr >= 0xffffffffc0298000 && addr < 0xffffffffc0299000
 info break
 ```
 
-断点 1、2、4 的条件把访问限定在目标 4 KiB 页的半开区间 `[0xffffffffc0298000, 0xffffffffc0299000)`；断点 3 则只匹配该页基址。`condition` 后的断点编号对应前面创建的断点。`info break` 用于核对编号、启用状态、条件和命中次数。该页在 `kern_init()` 的 `memset(edata, 0, end - edata)` 过程中可能先被写到，因此首次触发的地址可以是页内其他位置，而不一定正好是变量地址 `0xffffffffc0298548`。
+断点 1、2、4 覆盖目标 4 KiB 页，断点 3 匹配该页的虚拟基址。这个范围对应 `kern_init()` 中 `memset(edata, 0, end - edata)` 对目标页的首次写入；目标页内首次访存地址不必与变量首地址相同。
 
 ![宿主机 GDB 中的条件断点](./images/gdb4.png)
 
 #### 4. 观察首次 TLB 未命中
 
-宿主机 GDB 继续运行后，终端显示断点命中信息：
-
-```text
-Thread 3 "qemu-system-ris" hit Breakpoint 1, riscv_cpu_tlb_fill (...)
-    at ../qemu-6.2-debug-src/target/riscv/cpu_helper.c:821
-821 {
-```
-
-这行输出说明当前停在断点 1，断点所在函数是 `riscv_cpu_tlb_fill()`，源码位置为 `cpu_helper.c:821`。结合前面 `info break` 显示的设置结果——断点 1 位于 `riscv_cpu_tlb_fill`，条件限定目标虚拟页——可知这是目标页的访存进入了 QEMU 的 TLB 填充函数。
-
-`riscv_cpu_tlb_fill()` 是 QEMU 在软件 TLB 查找未找到可用转换时调用的填充入口。因此，**判断未命中的直接依据是 GDB 报告命中 `riscv_cpu_tlb_fill()` 断点**。接下来查看参数，确认这次函数调用对应目标页的写访问：
+宿主机 GDB 与客体 GDB 继续输入 `continue` 运行后，宿主机首先停在 `riscv_cpu_tlb_fill()`。参数显示此次访问位于目标页，访问类型为 `MMU_DATA_STORE`：
 
 ```gdb
 info args
 print/x address
 print access_type
 ```
-
-`info args` 显示当前函数参数；`print/x address` 以十六进制显示访存地址；`print access_type` 显示访问类型。截图中地址位于 `0xffffffffc0298000` 至 `0xffffffffc0299000` 之间，`access_type = MMU_DATA_STORE` 表示数据写访问。参数用来确认命中的确是目标访存；断点命中提示与断点设置位置共同说明 QEMU 进入了 TLB miss/fill 路径。
 
 ![目标页首次写访问](./images/gdb5.png)
 
@@ -1405,15 +1393,13 @@ x/wx $prot_ptr
 print/x $rax
 ```
 
-先用 `continue` 越过断点 1，再用 `disable 2` 暂时关闭断点 2，避免在同一查询函数入口再次停住；第二次 `continue` 将执行推进到 `get_physical_address()` 的返回位置断点 4。`bt 8` 显示调用栈，确认当前查询由 `riscv_cpu_tlb_fill()` 引发；`info args` 和 `print/x` 分别查看本次查询的输入地址、`satp`、页表项地址、页表项内容及 PPN。`satp` 的最高位表示 Sv39 模式，非零值说明分页已启用；`pte_addr` 是正在读取的页表项地址，`pte` 是其内容，`ppn` 是页表项中的物理页号。
-
-`set $physical_ptr = physical` 与 `set $prot_ptr = prot` 在函数返回前保存输出参数指针，因为 `finish` 会运行到当前函数退出，退出后局部参数不再处于当前栈帧。`x/gx` 按 8 字节读取转换得到的物理地址，`x/wx` 按 4 字节读取权限位。截图中的查询输入是目标页基址 `0xffffffffc0298000`，对应物理页基址 `0x80298000`；变量位于该页内偏移 `0x548`，所以变量对应的物理地址为 `0x80298548`。权限输出 `0x7` 表示该映射具备读、写、执行权限。`print/x $rax` 查看 QEMU 在宿主机 x86-64 上的函数返回值，`0` 表示 `get_physical_address()` 成功完成地址翻译。
+查询到的虚拟地址为 `0xffffffffc0298548`，`satp` 非零，页表项给出物理页 `0x80298000`。页内偏移 `0x548` 保持不变，最终物理地址为 `0x80298548`；权限值为 `0x7`，返回值 `0` 表示翻译成功。
 
 ![Sv39 页表遍历和地址转换结果](./images/gdb6.png)
 
 #### 6. 观察软件 TLB 回填
 
-页表查询成功后，QEMU 调用 `tlb_set_page()` 安装软件 TLB 项。宿主机 GDB 在断点 3 停下，说明已经走到回填路径。`bt 6` 显示调用链，`info args` 列出函数参数；`vaddr` 和 `paddr` 分别是映射的虚拟页基址、物理页基址，`size` 是映射长度。预期输出为虚拟页 `0xffffffffc0298000`、物理页 `0x80298000`、大小 `4096` 字节，表明一个 4 KiB 页的转换被加入软件 TLB。
+地址翻译完成后，宿主机 GDB 停在 `tlb_set_page()`。函数参数显示 QEMU 将虚拟页 `0xffffffffc0298000` 映射到物理页 `0x80298000`，页大小为 `4096` 字节：
 
 ```gdb
 continue
@@ -1428,29 +1414,26 @@ print size
 
 #### 7. 观察第二次访问命中 TLB
 
-在宿主机 GDB 中保留断点 1（TLB miss/fill 入口）启用，只关闭页表查询和回填过程中的断点 2、3、4，然后继续运行 QEMU：
+在终端 2 的宿主机 GDB 中关闭前面的四个断点，并继续运行 QEMU：
 
 ```gdb
-disable 2 3 4
-info break
+disable 1 2 3 4
 continue
 ```
 
-`disable` 只暂停断点，不删除断点；`info break` 应显示断点 1 的 `Enb` 为 `y`，断点 2、3、4 的 `Enb` 为 `n`。保留断点 1 是为了让后续若再次未命中时仍能被捕获。
-
-然后在终端 3 的客体 GDB 中，在目标加载指令断点处执行：
+然后在终端 3 的客体 GDB 中，在目标加载指令断点处继续运行：
 
 ```gdb
 continue
 ```
 
-若目标 `ld` 执行后客体 GDB 没有再次停在该指令，回到宿主机 GDB 按 `Ctrl-C` 中断其继续运行，再检查断点：
+目标加载指令再次访问同一页面后，终端 3 继续运行。回到终端 2，按 `Ctrl-C` 暂停宿主机 GDB，再查看断点计数：
 
 ```gdb
 info break
 ```
 
-判断时看断点 1：它仍应为启用状态（`Enb y`），命中次数仍为 1，且宿主机在这次继续运行期间没有停在断点 1。由于未命中会进入 `riscv_cpu_tlb_fill()` 并命中仍启用的断点 1，因此第二次访问没有触发该断点，说明命中了先前填入的软件 TLB。若把断点 1 也禁用，仅凭其命中次数不变不能证明 TLB 命中。
+断点命中次数保持不变，说明第二次访问由已填充的软件 TLB 完成，没有再次进入页表查询和回填路径。
 
 ![第二次访问命中软件 TLB](./images/gdb8.png)
 
@@ -1524,7 +1507,7 @@ x/gx $physical_ptr
 print/x $rax
 ```
 
-`si` 在客体 GDB 单步执行入口指令；宿主机的断点随后在 `get_physical_address()` 停下。`info args` 查看参数，`print/x addr` 显示输入地址，`print/x env->satp` 检查分页控制寄存器。这里 `addr = 0x80208000` 且 `satp = 0`，表示分页关闭；保存 `physical` 指针后用 `finish` 执行至函数返回，再用 `x/gx` 读取输出物理地址。输出仍为 `0x80208000`，`$rax = 0` 表示翻译成功。输入地址与输出物理地址相同，体现 Bare 模式下的恒等地址转换。
+结果为 `addr = 0x80208000`、`satp = 0`、输出物理地址 `0x80208000`、返回值 `0`。在 Bare 模式下，QEMU 将输入地址直接作为物理地址。
 
 ![Bare 模式地址转换结果](./images/gdb9.png)
 

@@ -71,6 +71,13 @@ size_t nr_free_pages(void) {
  *4. 将描述符数组之后的完整物理页面通过 init_memmap() 注册给当前物理内存管理器。
  *最终，npage、pages、页面保留状态和初始空闲页列表都被正确建立。
  */
+// `page_init()` 将探测到的 DRAM 范围转换为页分配器可管理的页面布局。
+// 它调用 `get_memory_base()`、`get_memory_size()` 取得基址和大小，
+// 检查范围并将管理上界限制在 `PHYSICAL_MEMORY_END` 内、按页向下对齐，确定 `maxpa` 和 `npage`。
+// 随后根据链接器符号 `end` 定位内核末尾，建立覆盖可管理页范围的 `Page` 描述符数组并先将页面标为保留；
+// 排除 OpenSBI、内核和描述符数组占用后，再通过 `init_memmap()` 
+// 把剩余完整空闲页注册给当前物理内存管理器。
+// 因此它负责建立页描述符、保护已占用页面并初始化空闲页区间。
 static void page_init(void) {
     // end 是链接器提供的符号，表示内核镜像末尾的内核虚拟地址。
     extern char end[];
