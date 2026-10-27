@@ -11,13 +11,12 @@ static free_area_t free_area;
 
 static void best_fit_check(void);
 
-// 初始化 Best-Fit 的有序空闲链表和空闲页计数。
 static void best_fit_init(void) {
     list_init(&free_list);
     nr_free = 0;
 }
 
-// 按物理地址插入空闲块，并只合并物理地址连续的前后块。
+// Insert in physical-address order and merge only physically adjacent blocks.
 static void best_fit_insert_block(struct Page *base, size_t n) {
     base->property = n;
     SetPageProperty(base);
@@ -53,7 +52,6 @@ static void best_fit_insert_block(struct Page *base, size_t n) {
     }
 }
 
-// 将一段仍处于保留状态的页面初始化为 Best-Fit 可管理的空闲块。
 static void best_fit_init_memmap(struct Page *base, size_t n) {
     assert(n > 0);
     for (struct Page *p = base; p != base + n; p++) {
@@ -67,7 +65,6 @@ static void best_fit_init_memmap(struct Page *base, size_t n) {
     best_fit_insert_block(base, n);
 }
 
-// 遍历空闲链表，选择满足请求的最小连续块；必要时分裂剩余部分。
 static struct Page *best_fit_alloc_pages(size_t n) {
     assert(n > 0);
     if (n > nr_free) {
@@ -78,7 +75,7 @@ static struct Page *best_fit_alloc_pages(size_t n) {
     for (list_entry_t *le = list_next(&free_list); le != &free_list;
          le = list_next(le)) {
         struct Page *p = le2page(le, page_link);
-        // 相同大小的候选块保留第一次遇到的块，即较低物理地址的块。
+        // Equal-sized candidates retain the first (lowest-address) block.
         if (p->property >= n && (best == NULL || p->property < best->property)) {
             best = p;
             if (p->property == n) {
@@ -105,7 +102,6 @@ static struct Page *best_fit_alloc_pages(size_t n) {
     return best;
 }
 
-// 清理待释放页面并重新插入空闲链表，同时合并相邻空闲块。
 static void best_fit_free_pages(struct Page *base, size_t n) {
     assert(n > 0);
     for (struct Page *p = base; p != base + n; p++) {
@@ -119,7 +115,6 @@ static void best_fit_free_pages(struct Page *base, size_t n) {
     best_fit_insert_block(base, n);
 }
 
-// 返回当前 Best-Fit 管理器维护的空闲页总数。
 static size_t best_fit_nr_free_pages(void) {
     return nr_free;
 }
