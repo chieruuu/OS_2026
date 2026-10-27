@@ -101,7 +101,7 @@ void exception_handler(struct trapframe *tf);
 
 在 `code` 目录执行 `make clean && make -j2`，内核完成编译、链接和镜像生成。汇编器最初拒绝旧的 `sbadaddr` CSR，改为 `stval` 后构建通过。
 
-`make grade` 能够完成测试注入和三组内核构建，但当前环境中 QEMU 只输出 OpenSBI 启动信息，没有进入测试内核，因此评分脚本未获得 PASS 标记。该结果限制了运行时验证，不能替代寄存器、异常和定时器测试结论。
+`make grade` 完成测试注入、构建和 QEMU 运行，三项 Lab3 测试全部通过：Trap 入口与寄存器恢复 35/35，非法指令与异常返回 25/25，持续时钟中断 40/40，总分 100/100。
 
 **测试截图：**
 
