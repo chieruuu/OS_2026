@@ -56,7 +56,6 @@ bootstack:
     .global bootstacktop
 bootstacktop:
 
-    .section .data
     # a page table for Sv39
     .align PGSHIFT
     .global boot_page_table_sv39

@@ -3,6 +3,11 @@
 #ifndef __LIBS_RISCV_H__
 #define __LIBS_RISCV_H__
 
+#ifdef __ASSEMBLER__
+/* Keep the framework CSR name usable with assemblers that require a number. */
+#define sbadaddr CSR_SBADADDR
+#endif
+
 #if __riscv_xlen == 64
 # define SLL32    sllw
 # define STORE    sd

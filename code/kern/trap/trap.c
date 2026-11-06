@@ -80,6 +80,7 @@ void print_regs(struct pushregs *gpr) {
     cprintf("  t6       0x%08x\n", gpr->t6);
 }
 
+//lab3 function2 2412940
 static uintptr_t trap_cause_code(uintptr_t cause) {
     return cause & (((uintptr_t)1 << (__riscv_xlen - 1)) - 1);
 }

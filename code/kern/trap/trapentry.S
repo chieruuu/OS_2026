@@ -44,7 +44,7 @@
     csrrw s0, sscratch, x0
     csrr s1, sstatus
     csrr s2, sepc
-    csrr s3, stval
+    csrr s3, sbadaddr
     csrr s4, scause
 
     STORE s0, 2*REGBYTES(sp)
@@ -55,6 +55,8 @@
     .endm
 
     .macro RESTORE_ALL
+
+    #lab3 function1 2412940
 
     # Restore privileged state while sp still points at the trap frame.
     LOAD t0, 32*REGBYTES(sp)
@@ -101,8 +103,10 @@
 __alltraps:
     SAVE_ALL
 
+    #lab3 function1 2412940
     mv a0, sp
     jal trap
+    # sp should be the same as before "jal trap"
 
     .globl __trapret
 __trapret:
