@@ -36,7 +36,7 @@
 
 ### 2.1 本章节的逻辑主线
 
-本实验围绕 RISC-V 的 Trap 处理闭环展开：硬件发生中断或异常后，处理器根据 `stvec` 跳转到统一入口 `__alltraps`。汇编入口首先执行 `SAVE_ALL`，将通用寄存器、原始栈指针以及 `sstatus`、`sepc`、`stval`、`scause` 保存为连续的 `struct trapframe`；随后把当前 `sp` 作为参数传给 C 函数 `trap`。C 层通过 `scause` 的最高位区分中断和异常，并进一步完成时钟中断、软件中断、外部中断、非法指令和断点异常的分发。处理结束后，`__trapret` 执行 `RESTORE_ALL` 恢复处理器状态，最后由 `sret` 回到被打断的执行流。
+本实验围绕 RISC-V 的 Trap 处理闭环展开：硬件发生中断或异常后，处理器根据 `stvec` 跳转到统一入口 `__alltraps`。汇编入口首先执行 `SAVE_ALL`，将通用寄存器、原始栈指针以及 `sstatus`、`sepc`、`sbadaddr`、`scause` 保存为连续的 `struct trapframe`；随后把当前 `sp` 作为参数传给 C 函数 `trap`。C 层通过 `scause` 的最高位区分中断和异常，并进一步完成时钟中断、软件中断、外部中断、非法指令和断点异常的分发。处理结束后，`__trapret` 执行 `RESTORE_ALL` 恢复处理器状态，最后由 `sret` 回到被打断的执行流。
 
 这一流程的核心是让汇编层的保存布局、C 层的 `struct trapframe` 定义和返回阶段的恢复顺序保持一致。这样，Trap 处理函数可以直接修改 `tf->epc` 等字段来控制返回位置，同时不影响被中断代码中其他寄存器的值。
 
@@ -66,7 +66,7 @@ RESTORE_ALL
 __alltraps
 ```
 
-`SAVE_ALL` 在 `sp` 的基础上分配 `36 * REGBYTES` 字节的 Trap frame，并按照 `struct pushregs` 的槽位顺序保存寄存器。由于 x2（`sp`）在保存前需要通过 `sscratch` 暂存，因此原始栈指针保存在第 2 个槽位；第 32 至第 35 个槽位依次保存 `sstatus`、`sepc`、`stval` 和 `scause`。这一布局与 `struct trapframe` 完全对应，为 C 语言处理函数提供了可读写的上下文对象。
+`SAVE_ALL` 在 `sp` 的基础上分配 `36 * REGBYTES` 字节的 Trap frame，并按照 `struct pushregs` 的槽位顺序保存寄存器。由于 x2（`sp`）在保存前需要通过 `sscratch` 暂存，因此原始栈指针保存在第 2 个槽位；第 32 至第 35 个槽位依次保存 `sstatus`、`sepc`、`sbadaddr` 和 `scause`。这一布局与 `struct trapframe` 完全对应，为 C 语言处理函数提供了可读写的上下文对象。
 
 `RESTORE_ALL` 按照与保存相反的职责恢复上下文。宏首先从第 32、33 个槽位读取 `sstatus` 和 `sepc`，写回对应 CSR，保证 `sret` 使用正确的特权状态和返回地址；随后恢复除 `sp` 外的全部通用寄存器，最后从第 2 个槽位恢复原始 `sp`。把 `sp` 的恢复放在最后，可以保证读取 Trap frame 的过程中始终使用有效的 frame 地址。
 
@@ -78,7 +78,7 @@ __alltraps
 
 #### 实现迭代过程
 
-实现以 `SAVE_ALL` 的实际槽位和 `struct trapframe` 的字段顺序为依据，补全了对称的 `RESTORE_ALL`，并在 `__alltraps` 中建立汇编到 C 的参数传递。CSR 读取和写回统一使用当前 RISC-V 工具链支持的 `stval`、`sstatus` 与 `sepc`，同时把原始 `sp` 的恢复安排在最后，保证整个恢复过程中 Trap frame 地址稳定。该实现直接覆盖了寄存器上下文保护、特权状态恢复和 `sret` 返回三个关键环节。
+实现以 `SAVE_ALL` 的实际槽位和 `struct trapframe` 的字段顺序为依据，补全了对称的 `RESTORE_ALL`，并在 `__alltraps` 中建立汇编到 C 的参数传递。返回阶段写回 `sstatus` 与 `sepc`，并将原始 `sp` 的恢复安排在最后，保证整个恢复过程中 Trap frame 地址稳定。该实现直接覆盖了寄存器上下文保护、特权状态恢复和 `sret` 返回三个关键环节。
 
 ### 功能模块二：中断与异常处理
 
@@ -111,7 +111,7 @@ void exception_handler(struct trapframe *tf);
 
 ## 五、测试与验证
 
-在 `code` 目录执行 `make clean && make -j2`，内核完成编译、链接和镜像生成。Trap 入口使用 `stval` 保存异常相关地址，汇编代码与当前 RISC-V 工具链的 CSR 定义保持一致。
+在 `code` 目录执行 `make clean && make -j2`，内核完成编译、链接和镜像生成。Trap 入口将 `sbadaddr` 的值保存到 `trapframe` 的 `badvaddr` 字段，供异常处理函数读取和输出。
 
 `make grade` 完成测试注入、构建和 QEMU 运行，三项 Lab3 测试全部通过：Trap 入口与寄存器恢复 35/35，非法指令与异常返回 25/25，持续时钟中断 40/40，总分 100/100。
 

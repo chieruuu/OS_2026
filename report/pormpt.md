@@ -6,7 +6,7 @@
 **输出要求**：完成代码后检查汇编能编译链接，不引入无关功能。
 
 [RELY]
-`SAVE_ALL` 在当前 `sp` 指向的 Trap frame 中依次保存 x0、x1、x3...x31，再保存原始 sp、sstatus、sepc、stval 和 scause；`struct trapframe` 的前 32 个槽是 `struct pushregs`，之后是 status、epc、badvaddr、cause。`trap` 的签名为 `void trap(struct trapframe *tf)`，`__trapret` 调用 `RESTORE_ALL` 后执行 `sret`。
+`SAVE_ALL` 在当前 `sp` 指向的 Trap frame 中依次保存 x0、x1、x3...x31，再保存原始 sp、sstatus、sepc、sbadaddr 和 scause；`struct trapframe` 的前 32 个槽是 `struct pushregs`，之后是 status、epc、badvaddr、cause。`trap` 的签名为 `void trap(struct trapframe *tf)`，`__trapret` 调用 `RESTORE_ALL` 后执行 `sret`。
 
 [GUARANTEE]
 必须实现或修改的接口：
