@@ -74,7 +74,7 @@ __alltraps
 
 #### 最终提示词
 
-见 [`pormpt.md`](./pormpt.md) 中第一个 `[PROMPT]` 块。
+见 [`prompt.md`](./prompt.md) 中第一个 `[PROMPT]` 块。
 
 #### 实现迭代过程
 
@@ -101,7 +101,7 @@ void exception_handler(struct trapframe *tf);
 
 #### 最终提示词
 
-见 [`pormpt.md`](./pormpt.md) 中第二个 `[PROMPT]` 块。
+见 [`prompt.md`](./prompt.md) 中第二个 `[PROMPT]` 块。
 
 #### 实现迭代过程
 
@@ -120,6 +120,10 @@ void exception_handler(struct trapframe *tf);
 下图为 `make grade` 的完整评分结果。输出显示非法指令异常返回测试通过、持续时钟中断测试通过，最终总分为 100/100；同一次评分运行前面的 Trap 入口与寄存器恢复测试也显示为 35/35。
 
 ![Lab3 make grade 测试结果](./image/grade.png)
+
+下图为 `make qemu` 的运行结果。内核完成初始化和物理内存管理检查后，输出 `++ setup timer interrupts`，随后连续打印 `100 ticks`，展示了时钟中断的持续触发与处理。
+
+![Lab3 QEMU 运行与持续时钟中断](./image/qemu.png)
 
 ---
 
