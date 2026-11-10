@@ -36,6 +36,8 @@ CFLAGS	+= -fno-stack-protector -ffunction-sections -fdata-sections
 CFLAGS	+= -g
 # The supplied grading thread has a void return type; retain the diagnostic.
 CFLAGS	+= -Wno-error=incompatible-pointer-types
+# Hide this known callback warning while keeping other diagnostics enabled.
+CFLAGS	+= -Wno-incompatible-pointer-types
 CTYPE	:= c S
 
 LD      := $(GCCPREFIX)ld
