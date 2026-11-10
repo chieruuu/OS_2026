@@ -88,6 +88,68 @@ size_t nr_free_pages(void)
 }
 
 //lab2 请补充你在lab2中的代码
+static void page_init(void) {
+    extern char end[];
+    uint64_t mem_base = get_memory_base();
+    uint64_t mem_size = get_memory_size();
+    uintptr_t address_max = ~(uintptr_t)0;
+
+    if (mem_base != DRAM_BASE || mem_size == 0 ||
+        mem_size > address_max - mem_base) {
+        panic("invalid physical memory range from device tree");
+    }
+    uintptr_t mem_end = mem_base + mem_size;
+    cprintf("physical memory map:\n"
+            "  memory: 0x%016lx, [0x%016lx, 0x%016lx].\n",
+            (unsigned long)mem_size, (unsigned long)mem_base,
+            (unsigned long)(mem_end - 1));
+
+    uintptr_t maxpa = ROUNDDOWN(
+        mem_end < (KERNTOP - PHYSICAL_MEMORY_OFFSET) ? mem_end : (KERNTOP - PHYSICAL_MEMORY_OFFSET),
+        PGSIZE);
+    if (PPN(maxpa) <= nbase) {
+        panic("no manageable physical pages");
+    }
+
+    va_pa_offset = PHYSICAL_MEMORY_OFFSET;
+    uintptr_t kernel_end = (uintptr_t)end;
+    if (kernel_end < KERNBASE || kernel_end > address_max - (PGSIZE - 1)) {
+        panic("invalid kernel end address");
+    }
+    uintptr_t pages_va = ROUNDUP(kernel_end, PGSIZE);
+    uintptr_t pages_pa = PADDR(pages_va);
+    size_t page_count = PPN(maxpa) - nbase;
+
+    // Validate the complete descriptor layout before writing any descriptors.
+    if (pages_pa > maxpa ||
+        page_count > (maxpa - pages_pa) / sizeof(struct Page)) {
+        panic("physical memory cannot hold the page descriptor array");
+    }
+    size_t descriptor_size = page_count * sizeof(struct Page);
+    if (descriptor_size > address_max - pages_va) {
+        panic("page descriptor virtual address overflow");
+    }
+    uintptr_t descriptors_end_pa = pages_pa + descriptor_size;
+
+    npage = PPN(maxpa);
+    pages = (struct Page *)pages_va;
+    for (size_t i = 0; i < page_count; i++) {
+        struct Page *p = &pages[i];
+        p->flags = 0;
+        SetPageReserved(p);
+        set_page_ref(p, 0);
+        p->property = 0;
+        list_init(&p->page_link);
+    }
+
+    // The descriptor array and both alignment gaps remain reserved.
+    uintptr_t free_start = ROUNDUP(descriptors_end_pa, PGSIZE);
+    if (free_start < maxpa) {
+        init_memmap(pa2page(free_start), (maxpa - free_start) / PGSIZE);
+    }
+}
+
+
 
 static void enable_paging(void)
 {
@@ -220,7 +282,46 @@ struct Page *get_page(pde_t *pgdir, uintptr_t la, pte_t **ptep_store)
     return NULL;
 }
 
-//LAB4 function1 YOUR CODE
+//LAB4 function1 2412940
+static void page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep)
+{
+    if (*ptep & PTE_V) {
+        struct Page *page = pte2page(*ptep);
+        if (page_ref_dec(page) == 0) {
+            free_page(page);
+        }
+        *ptep = 0;
+        tlb_invalidate(pgdir, la);
+    }
+}
+
+int page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm)
+{
+    pte_t *ptep = get_pte(pgdir, la, 1);
+    if (ptep == NULL) {
+        return -E_NO_MEM;
+    }
+    page_ref_inc(page);
+    if (*ptep & PTE_V) {
+        if (pte2page(*ptep) == page) {
+            page_ref_dec(page);
+        } else {
+            page_remove_pte(pgdir, la, ptep);
+        }
+    }
+    *ptep = pte_create(page2ppn(page), perm);
+    tlb_invalidate(pgdir, la);
+    return 0;
+}
+
+void page_remove(pde_t *pgdir, uintptr_t la)
+{
+    pte_t *ptep = get_pte(pgdir, la, 0);
+    if (ptep != NULL) {
+        page_remove_pte(pgdir, la, ptep);
+    }
+}
+
 
 
 

@@ -26,6 +26,10 @@ kern_entry:
     # 将刚才计算出的预设三级页表物理页号附加到 satp 中
     or      t0, t0, t1
     # 将算出的 t0(即新的MODE|页表基址物理页号) 覆盖到 satp 中
+    # Continue at the mapped high address after enabling Sv39.
+    lui     t2, %hi(.Lpaging_ready)
+    addi    t2, t2, %lo(.Lpaging_ready)
+    csrw    stvec, t2
     csrw    satp, t0
     # 使用 sfence.vma 指令刷新 TLB
     sfence.vma
@@ -33,7 +37,9 @@ kern_entry:
     #nop # 可能映射的位置有些bug。。插入一个nop
     
     # 我们在虚拟内存空间中：随意将 sp 设置为虚拟地址！
+ .Lpaging_ready:
     lui sp, %hi(bootstacktop)
+    addi sp, sp, %lo(bootstacktop)
 
     # 我们在虚拟内存空间中：随意跳转到虚拟地址！
     # 跳转到 kern_init

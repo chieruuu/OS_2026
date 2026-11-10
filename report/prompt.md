@@ -1,59 +1,71 @@
-[PROMPT]
-**任务**：修改 `code/kern/trap/trapentry.S`，完成 Trap 入口、上下文保存后的 C 函数调用和 Trap 返回时的寄存器恢复。保留 `SAVE_ALL`、`struct trapframe` 和既有入口标签，只补全标记位置。
-
-**操作要求**：直接修改实际文件；根据 `SAVE_ALL` 的真实布局实现对称恢复，遵守 RISC-V 调用约定，并保持 `trap(struct trapframe *tf)` 接口不变。
-
-**输出要求**：完成代码后检查汇编能编译链接，不引入无关功能。
-
-[RELY]
-`SAVE_ALL` 在当前 `sp` 指向的 Trap frame 中依次保存 x0、x1、x3...x31，再保存原始 sp、sstatus、sepc、sbadaddr 和 scause；`struct trapframe` 的前 32 个槽是 `struct pushregs`，之后是 status、epc、badvaddr、cause。`trap` 的签名为 `void trap(struct trapframe *tf)`，`__trapret` 调用 `RESTORE_ALL` 后执行 `sret`。
-
-[GUARANTEE]
-必须实现或修改的接口：
-```asm
-RESTORE_ALL
-__alltraps
-```
-
-[SPECIFICATION]
-**Pre-Condition**：`SAVE_ALL` 已建立完整 Trap frame，`sp` 指向其起始地址。
-
-**Post-Condition**：`__alltraps` 将当前 Trap frame 地址作为第一个参数传给 `trap`；`trap` 返回后，`RESTORE_ALL` 恢复所有通用寄存器及 `sstatus`、`sepc`，恢复原始栈指针，并使 `sret` 返回被打断的执行流。
-
-**Case 1**：Trap 入口保存完成后，调用 C 函数时不得破坏 Trap frame；调用返回后仍从同一 frame 恢复。
-
-**Case 2**：恢复 `sp` 时使用保存的原始 x2 值，不能把当前 Trap frame 地址误当成原始栈指针。
-
-**Case 3**：恢复顺序不能覆盖尚未读取的 frame 数据，且 `sret` 使用恢复后的 `sepc` 和状态寄存器。
-
-**Requirements**：不得修改 `SAVE_ALL`、Trap frame 布局或 `trap` 签名；所有寄存器（x0 除外）恢复后应与 Trap 前一致。
+## 功能模块一：虚拟内存页操作
 
 [PROMPT]
-**任务**：修改 `code/kern/trap/trap.c`，实现中断与异常处理模块，包括 `interrupt_handler` 和 `exception_handler`，接入已有的 Trap 分发流程。
+**任务**：在 pmm.c 的 LAB4 function1 标记处补全 page_insert、page_remove 及必要的内部撤销辅助函数。
 
-**操作要求**：直接修改实际文件，保留既有公共接口和辅助函数；使用工程中真实的宏、结构体和硬件接口，不修改无关模块。
+**操作要求**：只在要求补全的位置添加实现，保留原框架、所有已有注释和函数接口，将 YOUR CODE 替换为 2412940；不修改测试、不实现后续实验功能。
 
-**输出要求**：实现后完成构建，并验证时钟中断能够重新设定下一次事件、累计 ticks，非法指令和断点能够前进正确长度的 `epc`。
+**输出要求**：直接修改代码，并以框架测试验证行为。
 
 [RELY]
-可使用 `struct trapframe`、`print_trapframe`、`clock_set_next_event`、全局 `ticks`、`TICK_NUM`、`IRQ_S_TIMER`、`CAUSE_ILLEGAL_INSTRUCTION`、`CAUSE_BREAKPOINT`、`sbi_shutdown`、`cprintf` 和 RISC-V `cause` 编码。中断最高位表示 interrupt，异常 cause 为非负值。
+get_pte、pte_create、pte2page、page_ref_inc/dec、free_page、tlb_invalidate，以及现有 check_pgdir/check_boot_pgdir。
 
 [GUARANTEE]
-必须实现或修改的接口：
-```c
-void interrupt_handler(struct trapframe *tf);
-void exception_handler(struct trapframe *tf);
-```
+实现指导书列出的本模块全部接口，维持已有调用链和数据布局。
 
 [SPECIFICATION]
-**Pre-Condition**：函数收到由 Trap 入口建立的有效 `struct trapframe`。
+**Pre-Condition**：内存管理和本模块依赖的结构、接口已准备好；输入指针来自框架的合法对象。
 
-**Post-Condition**：处理完成后函数返回统一 Trap 返回路径；时钟中断可持续触发，已处理异常不会因 `epc` 未更新而重复陷入。
+**Post-Condition**：建立或更新指定地址的映射；撤销映射后引用计数和 TLB 同步。
 
-**Case 1**：Supervisor timer interrupt 每次先设置下一次时钟事件，再使 `ticks` 增加一次；每达到 `TICK_NUM` 的整数倍输出规定统计信息，并在达到实验规定次数后调用关机接口。
+**Cases**：同页重复插入只更新权限，引用计数不变；不同页替换释放旧引用；删除不存在的映射安静返回；get_pte 失败返回 -E_NO_MEM，不修改目标页引用计数。
 
-**Case 2**：Supervisor software、external 等已知中断输出对应提示；未知中断输出原因并调用 `print_trapframe`。
+**Requirements**：使用当前工程的 RISC-V 64 位定义，临界区恢复进入前的中断状态；保留原有测试和注释。
 
-**Case 3**：非法指令和断点输出规定信息，并依据 `epc` 处指令的低两位判断 16 位或 32 位长度后前移 `tf->epc`；其他异常调用 `print_trapframe`。
+## 功能模块二：进程创建及初始化
 
-**Requirements**：不得假定所有异常都是 4 字节指令；不得只计数而不重新设置定时器；不得修改函数签名或绕过真实 Trap 分发流程。
+[PROMPT]
+**任务**：在 proc.c 的 LAB4 function2 标记处实现 alloc_proc、copy_mm、copy_thread、do_fork、kernel_thread、proc_init。
+
+**操作要求**：只在要求补全的位置添加实现，保留原框架、所有已有注释和函数接口，将 YOUR CODE 替换为 2412940；不修改测试、不实现后续实验功能。
+
+**输出要求**：直接修改代码，并以框架测试验证行为。
+
+[RELY]
+proc_struct、trapframe、context、setup_kstack/put_kstack、hash_proc/get_pid、kmalloc/kfree、wakeup_proc、forkret、kernel_thread_entry。
+
+[GUARANTEE]
+实现指导书列出的本模块全部接口，维持已有调用链和数据布局。
+
+[SPECIFICATION]
+**Pre-Condition**：内存管理和本模块依赖的结构、接口已准备好；输入指针来自框架的合法对象。
+
+**Post-Condition**：初始化 idle/current/init，线程登记到 PID 哈希表和进程链表，唤醒后为 PROC_RUNNABLE；返回 PID 或负错误码。
+
+**Cases**：PCB 清零且 pid=-1，pgdir 为 boot_pgdir_pa；idle PID=0 且复用 bootstack；init PID=1，名字 init，参数 Hello world!!；申请失败释放已申请资源；tf 放栈顶，context.ra=forkret；内核线程不复制用户地址空间。
+
+**Requirements**：使用当前工程的 RISC-V 64 位定义，临界区恢复进入前的中断状态；保留原有测试和注释。
+
+## 功能模块三：调度与上下文切换
+
+[PROMPT]
+**任务**：在 function3 标记处补全 cpu_idle、proc_run、schedule 和 switch_to 汇编。
+
+**操作要求**：只在要求补全的位置添加实现，保留原框架、所有已有注释和函数接口，将 YOUR CODE 替换为 2412940；不修改测试、不实现后续实验功能。
+
+**输出要求**：直接修改代码，并以框架测试验证行为。
+
+[RELY]
+proc_list、current、idleproc、local_intr_save/restore、PROC_RUNNABLE、context 中 ra/sp/s0-s11 布局及 Sv39 页表。
+
+[GUARANTEE]
+实现指导书列出的本模块全部接口，维持已有调用链和数据布局。
+
+[SPECIFICATION]
+**Pre-Condition**：内存管理和本模块依赖的结构、接口已准备好；输入指针来自框架的合法对象。
+
+**Post-Condition**：轮转选择可运行线程，原子更新 current、satp 和上下文，首次切换经 forkret 到目标函数。
+
+**Cases**：current 为 idle 从表头找，否则从其后继开始；遍历一圈无就绪线程则选 idle；清除 need_resched 并累加 runs；目标相同时不切换；保存恢复 14 个上下文寄存器。
+
+**Requirements**：使用当前工程的 RISC-V 64 位定义，临界区恢复进入前的中断状态；保留原有测试和注释。
