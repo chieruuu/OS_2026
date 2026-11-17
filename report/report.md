@@ -400,7 +400,7 @@ switch_to:
 
 #### Challenge 1：`local_intr_save` 与 `local_intr_restore` 如何实现开关中断？
 
-`local_intr_save` 记录当前 CPU 的 S 态中断使能状态并关闭中断，`local_intr_restore` 根据保存的状态恢复。`kern/sync/sync.h` 中的实现如下：
+`local_intr_save` 和 `local_intr_restore` 通过操作 `sstatus` 寄存器中的 `SSTATUS_SIE` 位实现中断状态的保存、关闭和恢复。代码如下：
 
 ```c
 static inline bool __intr_save(void) {
@@ -424,126 +424,123 @@ static inline void __intr_restore(bool flag) {
 #define local_intr_restore(x) __intr_restore(x);
 ```
 
-`SSTATUS_SIE` 对应 `sstatus` 的 SIE 位。CPU 在 S 态执行时，SIE 为 1 允许响应已使能的 S 态中断，为 0 时屏蔽这些中断。具体中断还需要满足 `sie` 使能、挂起和委派条件。`kern/driver/intr.c` 通过以下函数修改 SIE：
+`__intr_save` 先读取 `SSTATUS_SIE`。如果该位为 1，调用 `intr_disable()` 清除该位，并返回 `true`；如果该位为 0，则返回 `false`。临界区结束后，`__intr_restore` 只在保存值为 `true` 时调用 `intr_enable()` 设置 `SSTATUS_SIE`。因此，恢复的是进入临界区前的状态。
+
+`intr_enable` 和 `intr_disable` 的实现是：
 
 ```c
 void intr_enable(void) { set_csr(sstatus, SSTATUS_SIE); }
 void intr_disable(void) { clear_csr(sstatus, SSTATUS_SIE); }
 ```
 
-`set_csr` 用 `csrrs` 设置指定的位，`clear_csr` 用 `csrrc` 清除指定的位，其他位保持原值。临界区中的执行过程如下：
-
-1. `local_intr_save(intr_flag)` 读取 SIE。原来允许中断时关闭中断并保存 `intr_flag=1`；原来已关闭时保存 `intr_flag=0`。
-2. 在中断关闭期间执行临界区代码，防止当前 CPU 的可屏蔽 S 态中断处理流程打断共享状态更新。
-3. `local_intr_restore(intr_flag)` 在标志为 1 时重新开启中断；标志为 0 时不操作，维持原来的关闭状态。该用法要求临界区内不自行开启中断。
-
-`proc_run` 需要连续更新 `current`、页表和寄存器现场。如果中途进入中断处理，这几个状态可能还未对应到同一个线程。关中断后再执行切换，可以避免本核中断处理打断这些更新。
-
-嵌套临界区需要分别保存进入时的状态。假设进入外层前 SIE=1，内外层各使用一个标志变量：
-
-| 执行位置 | 保存的标志 | 执行后 SIE |
-|------|------|------|
-| 外层 `local_intr_save(outer_flag)` | `outer_flag=1` | 0 |
-| 内层 `local_intr_save(inner_flag)` | `inner_flag=0` | 0 |
-| 内层 `local_intr_restore(inner_flag)` | 0，不开启 | 0 |
-| 外层 `local_intr_restore(outer_flag)` | 1，开启 | 1 |
-
-内层进入时中断已经关闭，因此 `inner_flag=0`，退出时也保持关闭。只有外层退出时，才根据 `outer_flag=1` 重新开启中断。如果退出内层时无条件开启中断，外层尚未完成的操作就失去了保护。
-
-本实验用关中断保护单核环境中的内存管理和进程切换操作。同步异常仍可发生，其他 CPU 也不受本核 SIE 控制，因此多核共享数据还需要锁等同步机制。
+`set_csr` 使用 `csrrs` 设置 SIE，`clear_csr` 使用 `csrrc` 清除 SIE。嵌套调用时，外层保存的状态为 `true`，内层保存的状态为 `false`；内层恢复时不会提前开启中断，外层恢复时才重新开启中断。
 
 #### Challenge 2：不同分页模式及 `get_pte()` 的设计分析
 
-##### 1. Sv32、Sv39、Sv48 有何异同？
+##### 1. Sv32、Sv39、Sv48 的区别
 
-Sv32、Sv39 和 Sv48 都通过多级页表完成地址转换。虚拟地址中的各级索引用来逐层查找页表，页内偏移确定页中的具体位置。页表项保存下一级页表地址或物理页地址，并记录权限。三种模式的主要区别如下：
+三种模式都使用多级页表，4 KiB 页的页内偏移均为 12 位。区别如下：
 
-| 比较项 | Sv32 | Sv39 | Sv48 |
+| 项目 | Sv32 | Sv39 | Sv48 |
 |------|------|------|------|
-| 对应架构 | RV32 | RV64 | RV64 |
-| 虚拟地址有效宽度 | 32 位 | 39 位 | 48 位 |
+| 处理器模式 | RV32 | RV64 | RV64 |
+| 虚拟地址宽度 | 32 位 | 39 位 | 48 位 |
 | 页表级数 | 2 级 | 3 级 | 4 级 |
-| 每级索引位数 | 10 位 | 9 位 | 9 位 |
-| 页内偏移 | 12 位 | 12 位 | 12 位 |
-| 页表项宽度 | 4 字节 | 8 字节 | 8 字节 |
-| 每张页表的项数 | 1024 | 512 | 512 |
-| 4 KiB 页的地址划分 | 10 + 10 + 12 | 9 + 9 + 9 + 12 | 9 + 9 + 9 + 9 + 12 |
+| 页表项大小 | 4 字节 | 8 字节 | 8 字节 |
+| 每页表项数 | 1024 | 512 | 512 |
+| 4 KiB 页地址划分 | 10+10+12 | 9+9+9+12 | 9+9+9+9+12 |
 
-每张页表占 4 KiB。Sv32 的页表项为 4 字节，一页可容纳 `4096 / 4 = 1024 = 2^10` 项，因此每级索引占 10 位。Sv39 和 Sv48 的页表项为 8 字节，一页容纳 `4096 / 8 = 512 = 2^9` 项，因此每级索引占 9 位。Sv39 要求虚拟地址的位 63–39 与位 38 相同，Sv48 要求位 63–48 与位 47 相同。三种模式都支持在较高层设置叶子项来映射大页，当前函数则逐层查找 4 KiB 页对应的 PTE。
+Sv32 的页表项为 4 字节，每页包含 1024 个页表项；Sv39 和 Sv48 的页表项为 8 字节，每页包含 512 个页表项。页表级数增加后，可表示的虚拟地址范围也随之扩大。
 
-##### 2. 为什么 `get_pte()` 中两段代码如此相像？
-
-当前工程采用 Sv39。`mmu.h` 中的索引定义对应以下三级划分：
+本实验使用 Sv39，虚拟地址的划分如下：
 
 ```text
-虚拟地址 la
-    PDX1(la) = 位 38–30：定位根页表中的目录项
-    PDX0(la) = 位 29–21：定位中间页表中的目录项
-    PTX(la)  = 位 20–12：定位末级页表中的 PTE
-    PGOFF(la)= 位 11–0 ：页内偏移
+PDX1(la)：位 38–30，根页表索引
+PDX0(la)：位 29–21，中间页表索引
+PTX(la)： 位 20–12，末级页表索引
+PGOFF(la)：位 11–0，页内偏移
 ```
 
-`kern/mm/pmm.c` 中的现有函数如下：
+##### 2. 为什么 `get_pte()` 中的两段代码相似？
+
+`get_pte()` 中的两段代码如下：
 
 ```c
-pte_t *get_pte(pde_t *pgdir, uintptr_t la, bool create)
+pde_t *pdep1 = &pgdir[PDX1(la)];
+if (!(*pdep1 & PTE_V))
 {
-    pde_t *pdep1 = &pgdir[PDX1(la)];
-    if (!(*pdep1 & PTE_V))
+    struct Page *page;
+    if (!create || (page = alloc_page()) == NULL)
     {
-        struct Page *page;
-        if (!create || (page = alloc_page()) == NULL)
-        {
-            return NULL;
-        }
-        set_page_ref(page, 1);
-        uintptr_t pa = page2pa(page);
-        memset(KADDR(pa), 0, PGSIZE);
-        *pdep1 = pte_create(page2ppn(page), PTE_U | PTE_V);
+        return NULL;
     }
-    pde_t *pdep0 = &((pte_t *)KADDR(PDE_ADDR(*pdep1)))[PDX0(la)];
-    if (!(*pdep0 & PTE_V))
+    set_page_ref(page, 1);
+    uintptr_t pa = page2pa(page);
+    memset(KADDR(pa), 0, PGSIZE);
+    *pdep1 = pte_create(page2ppn(page), PTE_U | PTE_V);
+}
+
+pde_t *pdep0 = &((pte_t *)KADDR(PDE_ADDR(*pdep1)))[PDX0(la)];
+if (!(*pdep0 & PTE_V))
+{
+    struct Page *page;
+    if (!create || (page = alloc_page()) == NULL)
     {
-        struct Page *page;
-        if (!create || (page = alloc_page()) == NULL)
-        {
-            return NULL;
-        }
-        set_page_ref(page, 1);
-        uintptr_t pa = page2pa(page);
-        memset(KADDR(pa), 0, PGSIZE);
-        *pdep0 = pte_create(page2ppn(page), PTE_U | PTE_V);
+        return NULL;
     }
-    return &((pte_t *)KADDR(PDE_ADDR(*pdep0)))[PTX(la)];
+    set_page_ref(page, 1);
+    uintptr_t pa = page2pa(page);
+    memset(KADDR(pa), 0, PGSIZE);
+    *pdep0 = pte_create(page2ppn(page), PTE_U | PTE_V);
 }
 ```
 
-第一段代码查找根页表项 `pdep1`，缺少下一级页表时分配中间页表；第二段查找中间页表项 `pdep0`，缺少下一级页表时分配末级页表。两段都要检查有效位、判断 `create`、申请物理页、设置引用计数、清零页表，最后将新页表的物理页号写入父目录项。
+两段代码分别处理 Sv39 页表的两个层级。第一段使用 `PDX1(la)` 从根页表找到中间页表，第二段使用 `PDX0(la)` 从中间页表找到末级页表。每一段都执行相同的操作：检查目录项的 `PTE_V` 位；目录项无效且 `create=0` 时返回 `NULL`；目录项无效且 `create=1` 时分配并清零下一级页表，设置引用计数，并把页表地址写入目录项。两段代码的相似性由多级页表逐级查找的结构决定。
 
-两段代码相似，是因为从根页表到末级页表，每下降一级都要根据地址索引找到目录项，并取得下一级页表地址。两处使用的层级和索引不同，分配及初始化方法相同。函数最后根据 `PTX(la)` 返回末级 PTE 的内核虚拟地址，数据页的映射则由 `page_insert` 完成。
+##### 3. 查找和分配放在同一个 `get_pte()` 中是否合适？
 
-对于 4 KiB 页，Sv32 从根页表下降一次就到达末级页表，所以需要一段这样的处理；Sv39 下降两次，Sv48 下降三次。N 级页表需要经过 N−1 次下级页表查找或创建。
-
-##### 3. 查找与页表页分配放在同一个函数中是否合适？是否需要拆开？
-
-`create` 参数让调用者可以选择只查找，或在查找时创建缺少的页表：
-
-- `get_pte(pgdir, la, 0)` 只查找，缺少任一级页表就返回 `NULL`。`page_remove` 使用这种方式，避免撤销映射时申请新页表。
-- `get_pte(pgdir, la, 1)` 查找并按需创建下层页表。`page_insert` 使用这种方式，无需在调用侧重复处理目录遍历和页表初始化。
-
-我认为本实验可以保留这种写法。页表层数固定，`page_insert` 和 `page_remove` 又能通过 `create` 选择各自需要的行为，将遍历和初始化放在同一个函数中能减少调用处的重复代码。
-
-这种写法需要注意分配失败后的状态。`create=0` 时，`NULL` 表示缺少页表；`create=1` 时，`NULL` 也可能表示内存不足。如果第一段已经创建中间页表，而第二段申请末级页表失败，函数会保留刚挂接的空中间页表。虽然目标数据页还没有映射，页表结构已经发生变化，调用者处理失败时需要考虑这一点。
-
-如果要区分查找失败和分配失败，或者统一处理页表分配后的回收，可以拆成两个接口。例如，`lookup_pte` 只查找，`ensure_pte` 负责创建缺少的页表并返回错误码：
+`get_pte()` 通过 `create` 参数控制是否分配缺失的下级页表。以下节选为第一级目录项无效时的处理代码：
 
 ```c
-/* 设计示意，不改变本实验现有接口。 */
-pte_t *lookup_pte(pde_t *pgdir, uintptr_t la);
-int ensure_pte(pde_t *pgdir, uintptr_t la, pte_t **ptep_store);
+pde_t *pdep1 = &pgdir[PDX1(la)];
+if (!(*pdep1 & PTE_V))
+{
+    struct Page *page;
+    if (!create || (page = alloc_page()) == NULL)
+    {
+        return NULL;
+    }
+    set_page_ref(page, 1);
+    uintptr_t pa = page2pa(page);
+    memset(KADDR(pa), 0, PGSIZE);
+    *pdep1 = pte_create(page2ppn(page), PTE_U | PTE_V);
+}
 ```
 
-拆分后，调用者可以直接从接口判断是否会分配内存，创建接口也能集中处理错误和页表回收。两个函数可以共用内部遍历代码。本实验的两个调用点使用 `create` 已经足够清楚，因此保留现有函数；后续需要更细的错误处理时，再拆分这两个操作。
+当 `create=0` 时，`!create` 为真，逻辑或运算短路，不会执行 `alloc_page()`，函数直接返回 `NULL`；当 `create=1` 时，才尝试分配下一级页表。下一级目录项的处理方式相同。
+
+删除映射的 `page_remove()` 传入 `0`，避免为不存在的映射分配页表：
+
+```c
+void page_remove(pde_t *pgdir, uintptr_t la)
+{
+    pte_t *ptep = get_pte(pgdir, la, 0);
+    if (ptep != NULL) {
+        page_remove_pte(pgdir, la, ptep);
+    }
+}
+```
+
+建立映射的 `page_insert()` 传入 `1`，允许按需创建页表。其获取页表项的代码如下：
+
+```c
+pte_t *ptep = get_pte(pgdir, la, 1);
+if (ptep == NULL) {
+    return -E_NO_MEM;
+}
+```
+
+本实验中将查找和分配放在同一个函数中是合适的。`create=0` 用于读取或删除映射，`create=1` 用于建立映射。这样多级页表遍历逻辑只需实现一次，调用者通过参数选择是否允许分配。
 
 ---
 
