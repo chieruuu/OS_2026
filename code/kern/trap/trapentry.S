@@ -1,6 +1,7 @@
 #include <riscv.h>
 
     .macro SAVE_ALL
+    /* 为通用寄存器和四个 CSR 状态预留 36 个槽，原 sp 暂存 sscratch。 */
     .align 2
 
     csrw sscratch, sp
@@ -53,6 +54,7 @@
     .endm
 
     .macro RESTORE_ALL
+    /* 按 trapframe 布局恢复状态；先用旧 sp 访问各槽，最后才恢复 sp。 */
     #lab3:填写你在lab3中实现的代码
 
 
@@ -96,8 +98,13 @@
 
     .endm
 
+/*
+ * 作用：进入中断或异常的通用处理路径。
+ * 实现：保存寄存器及状态，将 trapframe 指针作为参数调用 trap，然后进入返回路径。
+ */
     .globl __alltraps
 __alltraps:
+    /* 进入 C 函数前保存现场，把 trapframe 指针作为第一个参数传给 trap。 */
     SAVE_ALL
 
     #lab3:填写你在lab3中实现的代码
@@ -105,14 +112,24 @@ __alltraps:
     jal trap
     # sp should be the same as before "jal trap"
 
+/*
+ * 作用：恢复 trapframe 并返回指定执行位置。
+ * 实现：恢复通用寄存器、sstatus 和 sepc，最后用 sret 恢复执行。
+ */
     .globl __trapret
 __trapret:
+    /* 正常中断返回和新线程首次运行共用此路径。 */
     RESTORE_ALL
     # go back from supervisor call
     sret
  
+/*
+ * 作用：让新线程复用中断返回路径开始执行。
+ * 实现：把 a0 指向的初始 trapframe 用作当前栈上的现场，再跳到 __trapret。
+ */
     .globl forkrets
 forkrets:
+    /* a0=current->tf，切到新线程的 trapframe，随后由 sret 转到 tf->epc。 */
     # set stack to this new process's trapframe
     move sp, a0
     j __trapret

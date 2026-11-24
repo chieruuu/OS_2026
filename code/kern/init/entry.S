@@ -2,8 +2,13 @@
 #include <memlayout.h>
 
     .section .text,"ax",%progbits
+/*
+ * 作用：从固件接管执行并启动内核。
+ * 实现：保存 hart ID 和设备树地址，装入 Sv39 根页表转到高地址，设置内核栈后跳到 kern_init。
+ */
     .globl kern_entry
 kern_entry:
+    /* OpenSBI 进入 S 态内核的起点，与 process/entry.S 的线程入口作用不同。 */
     # a0: hartid
     # a1: dtb physical address
     # save hartid and dtb address
@@ -29,6 +34,7 @@ kern_entry:
     # Continue at the mapped high address after enabling Sv39.
     lui     t2, %hi(.Lpaging_ready)
     addi    t2, t2, %lo(.Lpaging_ready)
+    /* 启动页表只映射高地址；低地址取指缺页时经 stvec 转到高地址继续执行。 */
     csrw    stvec, t2
     csrw    satp, t0
     # 使用 sfence.vma 指令刷新 TLB
@@ -62,6 +68,7 @@ bootstacktop:
     .global boot_page_table_sv39
 # 分配 4KiB 内存给预设的三级页表
 boot_page_table_sv39:
+    /* Sv39 根项作为 1 GiB 大页叶子项，覆盖高地址内核，不再下降到下级页表。 */
     # 0xffffffff_c0000000 map to 0x80000000 (1G)
     # 前 511 个页表项均设置为 0 ，因此 V=0 ，意味着是空的(unmapped)
     .zero 8 * 511

@@ -39,10 +39,15 @@ struct pushregs
     uintptr_t t6;   // Temporary
 };
 
+// 中断或异常入口保存的通用寄存器及特权状态；也用来构造线程首次运行现场。
+// 布局必须与 trapentry.S 的 SAVE_ALL / RESTORE_ALL 一致，每槽占 REGBYTES。
+// `trapframe` 保存发生中断或异常时的完整通用寄存器以及 `sstatus`、`sepc`、`badvaddr`、`cause` 等状态，用于从陷阱返回时恢复处理器现场。
+// `context` 用于内核线程之间的函数级切换；`trapframe` 用于陷阱入口和返回，二者保存的场景与寄存器范围不同。
 struct trapframe
 {
     struct pushregs gpr;
     uintptr_t status;
+    // 恢复到 sepc 后，sret 从这里指定的指令地址继续执行。
     uintptr_t epc;
     uintptr_t badvaddr;
     uintptr_t cause;
