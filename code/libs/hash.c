@@ -10,13 +10,8 @@
  *
  * High bits are more random, so we use them.
  * */
-/*
- * 作用：把 32 位输入换算为 bits 位的哈希值。
- * 实现：用固定常数作乘法，取 32 位乘积的高 bits 位；PID 查找取其中 10 位作桶下标。
- */
 uint32_t
 hash32(uint32_t val, unsigned int bits) {
-    // 乘法结果截断为 32 位，再取高 bits 位；PID 查找取 10 位作桶下标。
     uint32_t hash = val * GOLDEN_RATIO_PRIME_32;
     return (hash >> (32 - bits));
 }

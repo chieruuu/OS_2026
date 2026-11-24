@@ -2,13 +2,8 @@
 #include <memlayout.h>
 
     .section .text,"ax",%progbits
-/*
- * 作用：从固件接管执行并启动内核。
- * 实现：保存 hart ID 和设备树地址，装入 Sv39 根页表转到高地址，设置内核栈后跳到 kern_init。
- */
     .globl kern_entry
 kern_entry:
-    /* OpenSBI 进入 S 态内核的起点，与 process/entry.S 的线程入口作用不同。 */
     # a0: hartid
     # a1: dtb physical address
     # save hartid and dtb address
@@ -16,7 +11,6 @@ kern_entry:
     sd a0, 0(t0)
     la t0, boot_dtb
     sd a1, 0(t0)
-    
     # t0 := 三级页表的虚拟地址
     lui     t0, %hi(boot_page_table_sv39)
     # t1 := 0xffffffff40000000 即虚实映射偏移量
@@ -31,11 +25,6 @@ kern_entry:
     # 将刚才计算出的预设三级页表物理页号附加到 satp 中
     or      t0, t0, t1
     # 将算出的 t0(即新的MODE|页表基址物理页号) 覆盖到 satp 中
-    # Continue at the mapped high address after enabling Sv39.
-    lui     t2, %hi(.Lpaging_ready)
-    addi    t2, t2, %lo(.Lpaging_ready)
-    /* 启动页表只映射高地址；低地址取指缺页时经 stvec 转到高地址继续执行。 */
-    csrw    stvec, t2
     csrw    satp, t0
     # 使用 sfence.vma 指令刷新 TLB
     sfence.vma
@@ -43,9 +32,7 @@ kern_entry:
     #nop # 可能映射的位置有些bug。。插入一个nop
     
     # 我们在虚拟内存空间中：随意将 sp 设置为虚拟地址！
- .Lpaging_ready:
     lui sp, %hi(bootstacktop)
-    addi sp, sp, %lo(bootstacktop)
 
     # 我们在虚拟内存空间中：随意跳转到虚拟地址！
     # 跳转到 kern_init
@@ -68,13 +55,11 @@ bootstacktop:
     .global boot_page_table_sv39
 # 分配 4KiB 内存给预设的三级页表
 boot_page_table_sv39:
-    /* Sv39 根项作为 1 GiB 大页叶子项，覆盖高地址内核，不再下降到下级页表。 */
     # 0xffffffff_c0000000 map to 0x80000000 (1G)
     # 前 511 个页表项均设置为 0 ，因此 V=0 ，意味着是空的(unmapped)
     .zero 8 * 511
     # 设置最后一个页表项，PPN=0x80000，标志位 VRWXAD 均为 1
     .quad (0x80000 << 10) | 0xcf # VRWXAD
-
     .global boot_hartid
 boot_hartid:
     .quad 0

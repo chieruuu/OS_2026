@@ -1,14 +1,20 @@
-#include <assert.h>
-#include <clock.h>
-#include <console.h>
 #include <defs.h>
-#include <kdebug.h>
-#include <memlayout.h>
 #include <mmu.h>
+#include <memlayout.h>
+#include <clock.h>
+#include <trap.h>
 #include <riscv.h>
 #include <stdio.h>
-#include <trap.h>
+#include <assert.h>
+#include <console.h>
 #include <vmm.h>
+#include <kdebug.h>
+#include <unistd.h>
+#include <syscall.h>
+#include <error.h>
+#include <sched.h>
+#include <sync.h>
+#include <sbi.h>
 
 #define TICK_NUM 100
 
@@ -21,8 +27,7 @@ static void print_ticks()
 #endif
 }
 
-/* idt_init - initialize IDT to each of the entry points in kern/trap/vectors.S
- */
+/* idt_init - initialize IDT to each of the entry points in kern/trap/vectors.S */
 void idt_init(void)
 {
     extern void __alltraps(void);
@@ -35,13 +40,20 @@ void idt_init(void)
     set_csr(sstatus, SSTATUS_SUM);
 }
 
+/* trap_in_kernel - test if trap happened in kernel */
+bool trap_in_kernel(struct trapframe *tf)
+{
+    return (tf->status & SSTATUS_SPP) != 0;
+}
+
 void print_trapframe(struct trapframe *tf)
 {
     cprintf("trapframe at %p\n", tf);
+    // cprintf("trapframe at 0x%x\n", tf);
     print_regs(&tf->gpr);
     cprintf("  status   0x%08x\n", tf->status);
     cprintf("  epc      0x%08x\n", tf->epc);
-    cprintf("  badvaddr 0x%08x\n", tf->badvaddr);
+    cprintf("  tval 0x%08x\n", tf->tval);
     cprintf("  cause    0x%08x\n", tf->cause);
 }
 
@@ -84,68 +96,12 @@ void print_regs(struct pushregs *gpr)
 extern struct mm_struct *check_mm_struct;
 
 //lab3 请补充你在lab3中的代码
-static uintptr_t trap_cause_code(uintptr_t cause) {
-    return cause & (((uintptr_t)1 << (__riscv_xlen - 1)) - 1);
-}
 
-static uintptr_t trap_instruction_length(uintptr_t epc) {
-    uint16_t instruction = *(volatile uint16_t *)(uintptr_t)epc;
-    return (instruction & 0x3) == 0x3 ? 4 : 2;
-}
-
-void interrupt_handler(struct trapframe *tf) {
-    uintptr_t cause = trap_cause_code(tf->cause);
-    switch (cause) {
-    case IRQ_S_SOFT:
-        cprintf("Supervisor software interrupt\n");
-        break;
-    case IRQ_S_TIMER:
-        clock_set_next_event();
-        ticks++;
-        if (ticks % TICK_NUM == 0) {
-            print_ticks();
-        }
-        break;
-    case IRQ_S_EXT:
-        cprintf("Supervisor external interrupt\n");
-        break;
-    default:
-        cprintf("Unknown interrupt: cause %d\n", (int)cause);
-        print_trapframe(tf);
-        break;
-    }
-}
-
-void exception_handler(struct trapframe *tf) {
-    switch (tf->cause) {
-    case CAUSE_ILLEGAL_INSTRUCTION:
-        cprintf("Illegal instruction at %p\n", (void *)tf->epc);
-        tf->epc += trap_instruction_length(tf->epc);
-        break;
-    case CAUSE_BREAKPOINT:
-        cprintf("Breakpoint at %p\n", (void *)tf->epc);
-        tf->epc += trap_instruction_length(tf->epc);
-        break;
-    default:
-        print_trapframe(tf);
-        break;
-    }
-}
+//lab5 function1 YOUR CODE update exception_handler
 
 
-
-
-
-
-/* *
- * trap - handles or dispatches an exception/interrupt. if and when trap()
- * returns,
- * the code in kern/trap/trapentry.S restores the old CPU state saved in the
- * trapframe and then uses the iret instruction to return from the exception.
- * */
-void trap(struct trapframe *tf)
+static inline void trap_dispatch(struct trapframe *tf)
 {
-    // dispatch based on what type of trap occurred
     if ((intptr_t)tf->cause < 0)
     {
         // interrupts
@@ -155,5 +111,42 @@ void trap(struct trapframe *tf)
     {
         // exceptions
         exception_handler(tf);
+    }
+}
+
+/* *
+ * trap - handles or dispatches an exception/interrupt. if and when trap() returns,
+ * the code in kern/trap/trapentry.S restores the old CPU state saved in the
+ * trapframe and then uses the iret instruction to return from the exception.
+ * */
+void trap(struct trapframe *tf)
+{
+    // dispatch based on what type of trap occurred
+    //    cputs("some trap");
+    if (current == NULL)
+    {
+        trap_dispatch(tf);
+    }
+    else
+    {
+        struct trapframe *otf = current->tf;
+        current->tf = tf;
+
+        bool in_kernel = trap_in_kernel(tf);
+
+        trap_dispatch(tf);
+
+        current->tf = otf;
+        if (!in_kernel)
+        {
+            if (current->flags & PF_EXITING)
+            {
+                do_exit(-E_KILLED);
+            }
+            if (current->need_resched)
+            {
+                schedule();
+            }
+        }
     }
 }
