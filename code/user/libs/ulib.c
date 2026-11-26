@@ -2,6 +2,7 @@
 #include <syscall.h>
 #include <stdio.h>
 #include <ulib.h>
+#include <string.h>
 
 void
 exit(int error_code) {
@@ -46,3 +47,8 @@ print_pgdir(void) {
     sys_pgdir();
 }
 
+
+int exec(const char *name, unsigned char *binary, size_t size)
+{
+    return sys_exec(name, strlen(name), binary, size);
+}

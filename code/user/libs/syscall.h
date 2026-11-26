@@ -9,6 +9,7 @@ int sys_kill(int64_t pid);
 int sys_getpid(void);
 int sys_putc(int64_t c);
 int sys_pgdir(void);
+int sys_exec(const char *name, size_t len, unsigned char *binary, size_t size);
 
 #endif /* !__USER_LIBS_SYSCALL_H__ */
 

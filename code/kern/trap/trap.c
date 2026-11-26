@@ -96,8 +96,82 @@ void print_regs(struct pushregs *gpr)
 extern struct mm_struct *check_mm_struct;
 
 //lab3 请补充你在lab3中的代码
+static uintptr_t
+trap_cause_code(uintptr_t cause)
+{
+    return cause & (((uintptr_t)1 << (__riscv_xlen - 1)) - 1);
+}
 
-//lab5 function1 YOUR CODE update exception_handler
+static uintptr_t
+trap_instruction_length(uintptr_t epc)
+{
+    uint16_t instruction = *(volatile uint16_t *)epc;
+    return (instruction & 0x3) == 0x3 ? 4 : 2;
+}
+
+void
+interrupt_handler(struct trapframe *tf)
+{
+    uintptr_t cause = trap_cause_code(tf->cause);
+    switch (cause)
+    {
+    case IRQ_S_SOFT:
+        cprintf("Supervisor software interrupt\n");
+        break;
+    case IRQ_S_TIMER:
+        clock_set_next_event();
+        ticks++;
+        if (current != NULL) current->need_resched = 1;
+        if (ticks % TICK_NUM == 0)
+        {
+            print_ticks();
+        }
+        break;
+    case IRQ_S_EXT:
+        cprintf("Supervisor external interrupt\n");
+        break;
+    default:
+        cprintf("Unknown interrupt: cause %d\n", (int)cause);
+        print_trapframe(tf);
+        break;
+    }
+}
+
+void
+exception_handler(struct trapframe *tf)
+{
+    switch (tf->cause)
+    {
+    case CAUSE_USER_ECALL:
+        tf->epc += 4;
+        syscall();
+        break;
+    case CAUSE_LOAD_PAGE_FAULT:
+    case CAUSE_STORE_PAGE_FAULT:
+    case CAUSE_FETCH_PAGE_FAULT:
+        if (current != NULL && current->mm != NULL &&
+            do_pgfault(current->mm, tf->cause, tf->tval) == 0) break;
+        if (!trap_in_kernel(tf)) do_exit(-E_KILLED);
+        print_trapframe(tf);
+        panic("unhandled kernel page fault");
+    case CAUSE_ILLEGAL_INSTRUCTION:
+        if (!trap_in_kernel(tf)) do_exit(-E_KILLED);
+        cprintf("Illegal instruction at %p\n", (void *)tf->epc);
+        tf->epc += trap_instruction_length(tf->epc);
+        break;
+    case CAUSE_BREAKPOINT:
+        if (!trap_in_kernel(tf)) do_exit(-E_KILLED);
+        cprintf("Breakpoint at %p\n", (void *)tf->epc);
+        tf->epc += trap_instruction_length(tf->epc);
+        break;
+    default:
+        if (!trap_in_kernel(tf)) do_exit(-E_KILLED);
+        print_trapframe(tf);
+        panic("unhandled kernel exception");
+    }
+}
+
+//lab5 function1 2412940 update exception_handler
 
 
 static inline void trap_dispatch(struct trapframe *tf)

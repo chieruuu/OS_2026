@@ -5,6 +5,8 @@
 #include <memlayout.h>
 #include <mmu.h>
 #include <pmm.h>
+#include <proc.h>
+#include <vmm.h>
 #include <sbi.h>
 #include <dtb.h>
 #include <stdio.h>
@@ -88,6 +90,70 @@ size_t nr_free_pages(void)
 }
 
 //lab2 请补充你在lab2中的代码
+static void
+page_init(void)
+{
+    extern char end[];
+    uint64_t mem_base = get_memory_base();
+    uint64_t mem_size = get_memory_size();
+    uintptr_t address_max = ~(uintptr_t)0;
+
+    if (mem_base != DRAM_BASE || mem_size == 0 || mem_size > address_max - mem_base)
+    {
+        panic("invalid physical memory range from device tree");
+    }
+    uintptr_t mem_end = mem_base + mem_size;
+    cprintf("physical memory map:\n"
+            "  memory: 0x%016lx, [0x%016lx, 0x%016lx].\n",
+            (unsigned long)mem_size, (unsigned long)mem_base,
+            (unsigned long)(mem_end - 1));
+
+    uintptr_t maxpa = ROUNDDOWN(
+        mem_end < (KERNTOP - PHYSICAL_MEMORY_OFFSET) ? mem_end : (KERNTOP - PHYSICAL_MEMORY_OFFSET),
+        PGSIZE);
+    if (PPN(maxpa) <= nbase)
+    {
+        panic("no manageable physical pages");
+    }
+
+    va_pa_offset = PHYSICAL_MEMORY_OFFSET;
+    uintptr_t kernel_end = (uintptr_t)end;
+    if (kernel_end < KERNBASE || kernel_end > address_max - (PGSIZE - 1))
+    {
+        panic("invalid kernel end address");
+    }
+    uintptr_t pages_va = ROUNDUP(kernel_end, PGSIZE);
+    uintptr_t pages_pa = PADDR(pages_va);
+    size_t page_count = PPN(maxpa) - nbase;
+    if (pages_pa > maxpa || page_count > (maxpa - pages_pa) / sizeof(struct Page))
+    {
+        panic("physical memory cannot hold the page descriptor array");
+    }
+    size_t descriptor_size = page_count * sizeof(struct Page);
+    if (descriptor_size > address_max - pages_va)
+    {
+        panic("page descriptor virtual address overflow");
+    }
+    uintptr_t descriptors_end_pa = pages_pa + descriptor_size;
+
+    npage = PPN(maxpa);
+    pages = (struct Page *)pages_va;
+    for (size_t i = 0; i < page_count; i++)
+    {
+        struct Page *p = &pages[i];
+        p->flags = 0;
+        SetPageReserved(p);
+        set_page_ref(p, 0);
+        p->property = 0;
+        list_init(&p->page_link);
+    }
+
+    uintptr_t free_start = ROUNDUP(descriptors_end_pa, PGSIZE);
+    if (free_start < maxpa)
+    {
+        init_memmap(pa2page(free_start), (maxpa - free_start) / PGSIZE);
+    }
+}
 
 // boot_map_segment - setup&enable the paging mechanism
 // parameters
@@ -306,6 +372,10 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
                 d0start += PTSIZE;
             } while (d0start != 0 && d0start < d1start + PDSIZE && d0start < end);
             // free level 0 page directory only when all pde0s in it are already invalid
+            // Other VMAs may still use page tables outside this subrange.
+            free_pd0 = 1;
+            for (int i = 0; i < NPDEENTRY; i++)
+                if (pd0[i] & PTE_V) { free_pd0 = 0; break; }
             if (free_pd0)
             {
                 free_page(pde2page(pde1));
@@ -318,10 +388,72 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
 }
 
 
-//lab5 function3 YOUR CODE 
+//lab5 function3 2412940
+int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end, bool share)
+{
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0);
+    assert(USER_ACCESS(start, end));
+    for (; start < end; start += PGSIZE) {
+        pte_t *src = get_pte(from, start, 0);
+        if (src == NULL || !(*src & PTE_V)) continue;
+        struct Page *page = pte2page(*src);
+        uint32_t perm = *src & (PTE_USER | PTE_COW);
+        if (share) {
+            if (perm & PTE_W) perm = (perm & ~PTE_W) | PTE_COW;
+            int ret = page_insert(to, page, start, perm);
+            if (ret != 0) return ret;
+            *src = pte_create(page2ppn(page), perm);
+            tlb_invalidate(from, start);
+        } else {
+            struct Page *copy = alloc_page();
+            if (copy == NULL) return -E_NO_MEM;
+            memcpy(page2kva(copy), page2kva(page), PGSIZE);
+            if (perm & PTE_COW) perm = (perm & ~PTE_COW) | PTE_W;
+            int ret = page_insert(to, copy, start, perm);
+            if (ret != 0) { free_page(copy); return ret; }
+        }
+    }
+    return 0;
+}
+
 
 
 //lab4 请补充你在lab4中的代码
+int
+page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm)
+{
+    pte_t *ptep = get_pte(pgdir, la, 1);
+    if (ptep == NULL)
+    {
+        return -E_NO_MEM;
+    }
+
+    page_ref_inc(page);
+    if (*ptep & PTE_V)
+    {
+        if (pte2page(*ptep) == page)
+        {
+            page_ref_dec(page);
+        }
+        else
+        {
+            page_remove_pte(pgdir, la, ptep);
+        }
+    }
+    *ptep = pte_create(page2ppn(page), perm);
+    tlb_invalidate(pgdir, la);
+    return 0;
+}
+
+void
+page_remove(pde_t *pgdir, uintptr_t la)
+{
+    pte_t *ptep = get_pte(pgdir, la, 0);
+    if (ptep != NULL)
+    {
+        page_remove_pte(pgdir, la, ptep);
+    }
+}
 
 
 // invalidate a TLB entry, but only if the page tables being
@@ -344,6 +476,7 @@ struct Page *pgdir_alloc_page(pde_t *pgdir, uintptr_t la, uint32_t perm)
             free_page(page);
             return NULL;
         }
+        memset(page2kva(page), 0, PGSIZE);
         // swap_map_swappable(check_mm_struct, la, page, 0);
         page->pra_vaddr = la;
         assert(page_ref(page) == 1);
@@ -520,4 +653,15 @@ static int get_pgtable_items(size_t left, size_t right, size_t start,
         return perm;
     }
     return 0;
+}
+
+void print_pgdir(void)
+{
+    pde_t *pgdir = current != NULL && current->mm != NULL
+        ? current->mm->pgdir : boot_pgdir_va;
+    for (size_t i = 0; i < NPDEENTRY; i++) {
+        if (!(pgdir[i] & PTE_V)) continue;
+        cprintf("PDE[%03d] pa=%016lx perm=%s\n", (int)i,
+                (unsigned long)PDE_ADDR(pgdir[i]), perm2str(pgdir[i]));
+    }
 }

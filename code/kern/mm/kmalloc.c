@@ -89,14 +89,14 @@ static void *__slob_get_free_pages(gfp_t gfp, int order)
 
 static inline void __slob_free_pages(unsigned long kva, int order)
 {
-	free_pages(kva2page(kva), 1 << order);
+	free_pages(kva2page((void *)kva), 1 << order);
 }
 
 static void slob_free(void *b, int size);
 
 static void *slob_alloc(size_t size, gfp_t gfp, int align)
 {
-	assert((size + SLOB_UNIT) < PAGE_SIZE);
+	assert(size > 0 && size <= PAGE_SIZE);
 
 	slob_t *prev, *cur, *aligned = 0;
 	int delta = 0, units = SLOB_UNITS(size);
@@ -172,7 +172,8 @@ static void slob_free(void *block, int size)
 		if (cur >= cur->next && (b > cur || b < cur->next))
 			break;
 
-	if (b + b->units == cur->next)
+	if (b + b->units == cur->next &&
+        ROUNDDOWN((uintptr_t)b, PAGE_SIZE) == ROUNDDOWN((uintptr_t)cur->next, PAGE_SIZE))
 	{
 		b->units += cur->next->units;
 		b->next = cur->next->next;
@@ -180,15 +181,27 @@ static void slob_free(void *block, int size)
 	else
 		b->next = cur->next;
 
-	if (cur + cur->units == b)
+	if (cur + cur->units == b &&
+        ROUNDDOWN((uintptr_t)cur, PAGE_SIZE) == ROUNDDOWN((uintptr_t)b, PAGE_SIZE))
 	{
 		cur->units += b->units;
 		cur->next = b->next;
+        b = cur;
 	}
 	else
 		cur->next = b;
 
 	slobfree = cur;
+    // Fresh pages (size == PAGE_SIZE) are inserted for allocation. On kfree,
+    // return a completely empty slab page to the physical allocator.
+    if (size != PAGE_SIZE && (uintptr_t)b % PAGE_SIZE == 0 &&
+        b->units == SLOB_UNITS(PAGE_SIZE)) {
+        slob_t *prev = &arena;
+        while (prev->next != b) prev = prev->next;
+        prev->next = b->next;
+        if (slobfree == b) slobfree = prev;
+        __slob_free_pages((uintptr_t)b, 0);
+    }
 
 	spin_unlock_irqrestore(&slob_lock, flags);
 }
@@ -220,7 +233,7 @@ kallocated(void)
 static int find_order(int size)
 {
 	int order = 0;
-	for (; size > 4096; size >>= 1)
+	for (; ((size_t)PAGE_SIZE << order) < (size_t)size;)
 		order++;
 	return order;
 }

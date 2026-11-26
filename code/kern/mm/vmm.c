@@ -181,9 +181,10 @@ int mm_map(struct mm_struct *mm, uintptr_t addr, size_t len, uint32_t vm_flags,
     int ret = -E_INVAL;
 
     struct vma_struct *vma;
-    if ((vma = find_vma(mm, start)) != NULL && end > vma->vm_start)
-    {
-        goto out;
+    list_entry_t *le = &mm->mmap_list;
+    while ((le = list_next(le)) != &mm->mmap_list) {
+        vma = le2vma(le, list_link);
+        if (start < vma->vm_end && end > vma->vm_start) goto out;
     }
     ret = -E_NO_MEM;
 
@@ -202,7 +203,69 @@ out:
     return ret;
 }
 
-//lab5 function3 YOUR CODE 
+//lab5 function3 2412940
+int dup_mmap(struct mm_struct *to, struct mm_struct *from)
+{
+    list_entry_t *le = &from->mmap_list;
+    while ((le = list_next(le)) != &from->mmap_list) {
+        struct vma_struct *vma = le2vma(le, list_link);
+        int ret = mm_map(to, vma->vm_start, vma->vm_end - vma->vm_start,
+                         vma->vm_flags, NULL);
+        if (ret != 0) return ret;
+#ifdef LAB5_EAGER_COPY
+        bool share = 0;
+#else
+        bool share = 1;
+#endif
+        ret = copy_range(to->pgdir, from->pgdir, vma->vm_start, vma->vm_end, share);
+        if (ret != 0) return ret;
+    }
+    return 0;
+}
+
+int cow_resolve(struct mm_struct *mm, uintptr_t addr)
+{
+    struct vma_struct *vma = find_vma(mm, addr);
+    if (vma == NULL || !(vma->vm_flags & VM_WRITE)) return -E_INVAL;
+    pte_t *pte = get_pte(mm->pgdir, addr, 0);
+    if (pte == NULL || !(*pte & PTE_V) || !(*pte & PTE_COW)) return -E_INVAL;
+    struct Page *old = pte2page(*pte);
+    uint32_t perm = ((*pte & PTE_USER) | PTE_W) & ~PTE_COW;
+    if (page_ref(old) == 1) {
+        *pte = pte_create(page2ppn(old), perm);
+        tlb_invalidate(mm->pgdir, addr);
+        return 0;
+    }
+    struct Page *copy = alloc_page();
+    if (copy == NULL) return -E_NO_MEM;
+    memcpy(page2kva(copy), page2kva(old), PGSIZE);
+    int ret = page_insert(mm->pgdir, copy, ROUNDDOWN(addr, PGSIZE), perm);
+    if (ret != 0) free_page(copy);
+    return ret;
+}
+
+int do_pgfault(struct mm_struct *mm, uint32_t cause, uintptr_t addr)
+{
+    struct vma_struct *vma = find_vma(mm, addr);
+    uint32_t access = cause == CAUSE_STORE_PAGE_FAULT ? VM_WRITE :
+                      cause == CAUSE_FETCH_PAGE_FAULT ? VM_EXEC : VM_READ;
+    if (vma == NULL || !(vma->vm_flags & access) ||
+        ((vma->vm_flags & VM_STACK) && addr < vma->vm_start + PGSIZE))
+        return -E_INVAL;
+    pte_t *pte = get_pte(mm->pgdir, addr, 0);
+    if (pte != NULL && (*pte & PTE_V)) {
+        if (cause == CAUSE_STORE_PAGE_FAULT && (*pte & PTE_COW))
+            return cow_resolve(mm, addr);
+        return -E_INVAL;
+    }
+    uint32_t perm = PTE_U;
+    if (vma->vm_flags & VM_READ) perm |= PTE_R;
+    if (vma->vm_flags & VM_WRITE) perm |= PTE_R | PTE_W;
+    if (vma->vm_flags & VM_EXEC) perm |= PTE_X;
+    return pgdir_alloc_page(mm->pgdir, ROUNDDOWN(addr, PGSIZE), perm)
+        != NULL ? 0 : -E_NO_MEM;
+}
+
 
 
 
@@ -239,7 +302,21 @@ bool copy_to_user(struct mm_struct *mm, void *dst, const void *src, size_t len)
     {
         return 0;
     }
-    memcpy(dst, src, len);
+    if (mm == NULL) { memcpy(dst, src, len); return 1; }
+    // Resolve each COW mapping before obtaining a writable physical alias.
+    while (len != 0) {
+        uintptr_t addr = (uintptr_t)dst;
+        pte_t *pte = get_pte(mm->pgdir, addr, 0);
+        if (pte == NULL || !(*pte & PTE_V) || (*pte & PTE_COW)) {
+            if (do_pgfault(mm, CAUSE_STORE_PAGE_FAULT, addr) != 0) return 0;
+            pte = get_pte(mm->pgdir, addr, 0);
+        }
+        if (!(*pte & PTE_U) || !(*pte & PTE_W)) return 0;
+        size_t n = PGSIZE - PGOFF(addr);
+        if (n > len) n = len;
+        memcpy(page2kva(pte2page(*pte)) + PGOFF(addr), src, n);
+        dst += n; src += n; len -= n;
+    }
     return 1;
 }
 
@@ -257,6 +334,7 @@ check_vmm(void)
     // size_t nr_free_pages_store = nr_free_pages();
 
     check_vma_struct();
+    check_cow();
     // check_pgfault();
 
     cprintf("check_vmm() succeeded.\n");

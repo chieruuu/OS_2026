@@ -7,6 +7,22 @@
 #include <assert.h>
 
 
+#include <error.h>
+
+static int sys_exit(uint64_t a[]) { return do_exit((int)a[0]); }
+static int sys_fork(uint64_t a[]) {
+    return do_fork(0, current->tf->gpr.sp, current->tf);
+}
+static int sys_wait(uint64_t a[]) { return do_wait((int)a[0], (int *)a[1]); }
+static int sys_exec(uint64_t a[]) {
+    return do_execve((const char *)a[0], a[1], (unsigned char *)a[2], a[3]);
+}
+static int sys_yield(uint64_t a[]) { return do_yield(); }
+static int sys_kill(uint64_t a[]) { return do_kill((int)a[0]); }
+static int sys_getpid(uint64_t a[]) { return current->pid; }
+static int sys_putc(uint64_t a[]) { cputchar((int)a[0]); return 0; }
+static int sys_pgdir(uint64_t a[]) { print_pgdir(); return 0; }
+
 static int (*syscalls[])(uint64_t arg[]) = {
     [SYS_exit]              sys_exit,
     [SYS_fork]              sys_fork,
@@ -21,4 +37,14 @@ static int (*syscalls[])(uint64_t arg[]) = {
 
 #define NUM_SYSCALLS        ((sizeof(syscalls)) / (sizeof(syscalls[0])))
 
-//lab5 function1 YOUR CODE
+//lab5 function1 2412940
+
+void syscall(void)
+{
+    struct trapframe *tf = current->tf;
+    uint64_t num = tf->gpr.a0;
+    uint64_t args[] = {tf->gpr.a1, tf->gpr.a2, tf->gpr.a3,
+                       tf->gpr.a4, tf->gpr.a5};
+    tf->gpr.a0 = (num < NUM_SYSCALLS && syscalls[num] != NULL)
+        ? syscalls[num](args) : -E_INVAL;
+}

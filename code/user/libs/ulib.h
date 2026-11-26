@@ -25,6 +25,7 @@ void __noreturn __panic(const char *file, int line, const char *fmt, ...);
 
 void __noreturn exit(int error_code);
 int fork(void);
+int exec(const char *name, unsigned char *binary, size_t size);
 int wait(void);
 int waitpid(int pid, int *store);
 void yield(void);

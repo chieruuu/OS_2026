@@ -78,6 +78,7 @@
 #define PTE_G 0x020    // Global
 #define PTE_A 0x040    // Accessed
 #define PTE_D 0x080    // Dirty
+#define PTE_COW 0x100 // Originally writable private page, shared until a write
 #define PTE_SOFT 0x300 // Reserved for Software
 
 #define PAGE_TABLE_DIR (PTE_V)
